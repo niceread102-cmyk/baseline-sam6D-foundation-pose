@@ -11,7 +11,7 @@ import logging
 import os.path as osp
 from typing import Any, Dict, List, Optional, Tuple
 import pytorch_lightning as pl
-from ultralytics import yolo  # noqa
+from ultralytics.models.yolo.segment import SegmentationPredictor
 from ultralytics.nn.autobackend import AutoBackend
 
 
@@ -39,8 +39,9 @@ class CustomYOLO(YOLO):
         self.overrides["conf"] = 0.25
         self.overrides["mode"] = "predict"
         self.overrides["save"] = False
+        self.overrides["retina_masks"] = True  # return masks at orig image resolution (no letterbox squish)
 
-        self.predictor = yolo.v8.segment.SegmentationPredictor(
+        self.predictor = SegmentationPredictor(
             overrides=self.overrides, _callbacks=self.callbacks
         )
 
@@ -92,12 +93,7 @@ class FastSAM(object):
         logging.info(f"Init FastSAM done!")
 
     def postprocess_resize(self, detections, orig_size, update_boxes=False):
-        detections["masks"] = F.interpolate(
-            detections["masks"].unsqueeze(1).float(),
-            size=(orig_size[0], orig_size[1]),
-            mode="bilinear",
-            align_corners=False,
-        )[:, 0, :, :]
+        # masks are already at orig_size thanks to retina_masks=True
         if update_boxes:
             scale = orig_size[1] / self.segmentor_width_size
             detections["boxes"] = detections["boxes"].float() * scale

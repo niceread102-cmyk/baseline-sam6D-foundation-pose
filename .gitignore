@@ -1,3 +1,9 @@
+*.pth
+*.ckpt
+cnos_templates/
+*.pt
+datasets/
+
 # Additional 
 configs/user/nguyen.yaml
 .vscode/
