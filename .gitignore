@@ -1,14 +1,13 @@
 *.pth
 *.ckpt
-cnos_templates/
 *.pt
 datasets/
 sam6d_templates/
+FoundationPose-main/weights/
+SAM-6D-main/SAM-6D/Instance_Segmentation_Model/checkpoints/
 
-# Additional 
-configs/user/nguyen.yaml
+# Additional
 .vscode/
-.hydra/
 outputs/
 slurm/
 slurm_logs/

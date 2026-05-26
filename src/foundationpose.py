@@ -74,7 +74,8 @@ class FoundationPoseRefiner:
         self.min_pose_score = min_pose_score
         self.debug = debug
         self.debug_dir = str(debug_dir) if debug_dir else "/tmp/foundationpose_debug"
-        os.makedirs(self.debug_dir, exist_ok=True)
+        if self.debug >= 2:
+            os.makedirs(self.debug_dir, exist_ok=True)
 
         _ensure_fp_paths()
         self._check_mycpp()
@@ -211,7 +212,6 @@ class FoundationPoseRefiner:
         depth_m = self._depth_to_metres(depth, depth_scale)
 
         pose_scores = sam6d_results["pose_scores"]
-        n = len(pose_scores)
         order = np.argsort(pose_scores)[::-1]  # descending by score
         selected = [i for i in order if pose_scores[i] >= self.min_pose_score]
         if self.max_detections is not None:
@@ -229,7 +229,7 @@ class FoundationPoseRefiner:
                 ob_mask=mask,
                 iteration=self.est_refine_iter,
             )
-            fp_score = float(est.scores[0].item()) if hasattr(est, "scores") else float("nan")
+            fp_score = float(est.scores[0].item())
             self._est_list.append(est)
             results.append(
                 {

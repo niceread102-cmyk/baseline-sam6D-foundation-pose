@@ -26,6 +26,8 @@ SAM_WEIGHTS = {
     "vit_b": ("sam_vit_b_01ec64.pth", "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"),
 }
 
+_N_TEMPLATES = 42  # views in cam_poses_level0.npy (level-0 icosphere)
+
 
 def _ensure_sam6d_paths():
     for p in [
@@ -45,7 +47,6 @@ class SAM6D:
         device: str = "cuda",
 
         # Segmentor
-        segmentor: str = "sam",
         sam_checkpoint: Optional[Union[str, Path]] = None,
         sam_model_type: str = "vit_h",
         stability_score_thresh: float = 0.97,
@@ -198,7 +199,13 @@ class SAM6D:
             return
         target.parent.mkdir(parents=True, exist_ok=True)
         logging.info(f"Downloading SAM {sam_model_type} ...")
-        os.system(f"wget -O {target} {SAM_WEIGHTS[sam_model_type][1]} --no-check-certificate")
+        ret = os.system(f"wget -q -O {target} {SAM_WEIGHTS[sam_model_type][1]} --no-check-certificate")
+        if ret != 0:
+            raise RuntimeError(
+                f"Failed to download SAM {sam_model_type} weights (exit {ret}).\n"
+                f"Download manually: {SAM_WEIGHTS[sam_model_type][1]}\n"
+                f"Place at: {target}"
+            )
 
     def _maybe_download_dinov2(self, dinov2_checkpoint_dir, save_dir):
         if dinov2_checkpoint_dir:
@@ -210,7 +217,13 @@ class SAM6D:
         target.parent.mkdir(parents=True, exist_ok=True)
         logging.info("Downloading DINOv2 weights ...")
         url = "https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_pretrain.pth"
-        os.system(f"wget -O {target} {url} --no-check-certificate")
+        ret = os.system(f"wget -q -O {target} {url} --no-check-certificate")
+        if ret != 0:
+            raise RuntimeError(
+                f"Failed to download DINOv2 weights (exit {ret}).\n"
+                f"Download manually: {url}\n"
+                f"Place at: {target}"
+            )
 
     def _maybe_download_pem(self, pem_checkpoint, save_dir):
         if pem_checkpoint and Path(pem_checkpoint).exists():
@@ -220,10 +233,16 @@ class SAM6D:
             return
         Path(save_dir).mkdir(parents=True, exist_ok=True)
         logging.info("Downloading PEM checkpoint ...")
-        os.system(
+        ret = os.system(
             f"gdown --no-cookies --no-check-certificate "
             f"-O '{target}' 1joW9IvwsaRJYxoUmGo68dBVg-HcFNyI7"
         )
+        if ret != 0 or not target.exists():
+            raise RuntimeError(
+                f"Failed to download SAM-6D PEM checkpoint (exit {ret}).\n"
+                "Download manually with gdown ID: 1joW9IvwsaRJYxoUmGo68dBVg-HcFNyI7\n"
+                f"Place at: {target}"
+            )
 
     # ------------------------------------------------------------------
     # Template rendering
@@ -236,7 +255,7 @@ class SAM6D:
         n_rgb  = len(list(self._tmpl_dir.glob("rgb_*.png")))
         n_xyz  = len(list(self._tmpl_dir.glob("xyz_*.npy")))
         n_mask = len(list(self._tmpl_dir.glob("mask_*.png")))
-        n_expected = 42
+        n_expected = _N_TEMPLATES
         if not reset_templates and n_rgb == n_expected and n_xyz == n_expected and n_mask == n_expected:
             logging.info(f"Templates already at {self._tmpl_dir}, skipping render.")
             return
@@ -390,11 +409,11 @@ class SAM6D:
 
     def _extract_pem_templates(self):
         all_tem, all_tem_pts, all_tem_choose = [], [], []
-        total_n = 42
+        total_n = _N_TEMPLATES
         for v in range(self.n_template_view):
             i = int(total_n / self.n_template_view * v)
             tem, tem_choose, tem_pts = self._get_pem_template(i)
-            all_tem.append(torch.FloatTensor(tem).unsqueeze(0).to(self.device))
+            all_tem.append(tem.float().unsqueeze(0).to(self.device))
             all_tem_choose.append(torch.LongTensor(tem_choose).unsqueeze(0).to(self.device))
             all_tem_pts.append(torch.FloatTensor(tem_pts).unsqueeze(0).to(self.device))
 

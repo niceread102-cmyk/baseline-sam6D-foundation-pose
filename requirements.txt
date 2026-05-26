@@ -1,0 +1,65 @@
+# ============================================================
+# requirements.txt for SAM-6D + FoundationPose pose estimation
+# ============================================================
+#
+# Install in this order:
+#
+#   Step 1 — PyTorch (match CUDA version to your driver):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+#   Step 2 — nvdiffrast (requires nvcc on PATH, i.e. CUDA toolkit installed):
+#     pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git
+#
+#   Step 3 — everything else:
+#     pip install -r requirements.txt
+
+# --- Core numerics ---
+numpy>=1.26
+scipy
+scikit-learn
+h5py
+
+# --- Image / vision ---
+opencv-python
+Pillow
+imageio
+scikit-image
+
+# --- 3D geometry ---
+trimesh>=4.0
+open3d
+transformations
+
+# --- Visualization ---
+matplotlib
+pyrender
+pyOpenGL>=3.1
+pyOpenGL_accelerate>=3.1
+
+# --- Deep learning extras (torch installed separately above) ---
+kornia>=0.7
+timm
+einops
+
+# --- SAM-6D PEM runtime ---
+gorilla-core==0.2.7.8
+
+# --- Template rendering ---
+blenderproc>=2.6.1
+
+# --- FoundationPose runtime ---
+warp-lang
+
+# --- Config / serialization ---
+omegaconf>=2.3
+PyYAML>=6
+ruamel.yaml>=0.18
+
+# --- Utilities ---
+tqdm
+psutil
+gdown
+
+# --- Notebook ---
+jupyter
+ipykernel

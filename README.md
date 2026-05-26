@@ -1,262 +1,184 @@
-<div align="center">
-<h2>
-CNOS: A Strong Baseline for CAD-based Novel Object Segmentation
-</h2>
+# 6D Object Pose Estimation with SAM-6D and FoundationPose
 
-<h3>
-<a href="https://nv-nguyen.github.io/" target="_blank"><nobr>Van Nguyen Nguyen</nobr></a> &emsp;
-<a href="http://imagine.enpc.fr/~groueixt/" target="_blank"><nobr>Thibault Groueix</nobr></a> &emsp;
+This repository wraps [SAM-6D](https://github.com/JiehongLin/SAM-6D) and [FoundationPose](https://github.com/NVlabs/FoundationPose) into two clean Python classes for zero-shot 6D object pose estimation from RGB-D images. No training is required — only a CAD model of the object.
 
-<a href="https://ponimatkin.github.io/" target="_blank"><nobr>Georgy Ponimatkin</nobr></a> &emsp;
-<a href="https://vincentlepetit.github.io/" target="_blank"><nobr>Vincent Lepetit</nobr></a> &emsp;
-<a href="https://cmp.felk.cvut.cz/~hodanto2/" target="_blank"><nobr>Tomáš Hodaň</nobr></a> &emsp; <br>
-<p></p>
+See `sam6d_example.ipynb` for a full end-to-end walkthrough.
 
-<a href="https://nv-nguyen.github.io/cnos/"><img 
-src="https://img.shields.io/badge/-Webpage-blue.svg?colorA=333&logo=html5" height=25em></a>
-<a href="http://arxiv.org/abs/2307.11067"><img 
-src="https://img.shields.io/badge/-Paper-blue.svg?colorA=333&logo=arxiv" height=25em></a>
-<p></p>
+## How it works
 
-![framework](./media/framework.png)
+**SAM-6D** (`src/sam6d.py`) runs a two-stage pipeline:
+1. **ISM** — SAM generates mask proposals; DINOv2 scores them against rendered CAD templates via semantic, appearance, and geometric similarity.
+2. **PEM** — A ViT-based pose estimation model takes the top proposals and returns 6DoF poses (R, t) in millimetres.
 
-![qualitative](./media/qualitative.png)
-</h3>
-</div>
+**FoundationPose** (`src/foundationpose.py`) refines the SAM-6D initial poses via iterative RGB-D render-and-compare, then tracks registered objects on subsequent frames without re-running SAM-6D.
 
-CNOS is a simple three-stage approach for CAD-based novel object segmentation. It is based on [Segmenting Anything](https://github.com/facebookresearch/segment-anything), [DINOv2](https://github.com/facebookresearch/dinov2) and can be used for any objects without retraining. CNOS outperforms the supervised MaskRCNN (in CosyPose) which was trained on target objects. CNOS has been used as the baseline for [Task 5](https://bop.felk.cvut.cz/leaderboards/detection-unseen-bop23/core-datasets/) and [Task 6](https://bop.felk.cvut.cz/leaderboards/segmentation-unseen-bop23/core-datasets/) in [BOP challenge 2023](https://bop.felk.cvut.cz/challenges/bop-challenge-2023/)!
+---
 
-![bo results](./media/bop_results.png)
+## System Prerequisites
 
-Here are some qualitative results of CNOS on the YCBV dataset. We are displaying only detections with a confidence score greater than 0.5 for better visibility.
-![ycbv](./media/ycbv.gif)
-If our project is helpful for your research, please consider citing : 
-```latex
-@inproceedings{nguyen2023cnos,
-title={CNOS: A Strong Baseline for CAD-based Novel Object Segmentation},
-author={Nguyen, Van Nguyen and Groueix, Thibault and Ponimatkin, Georgy and Lepetit, Vincent and Hodan, Tomas},
-booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
-pages={2134--2140},
-year={2023}
-}
-```
-You can also put a star :star:, if the code is useful to you.
+- **CUDA 11.8+** — tested on CUDA 12.9 (sm_86 / RTX A6000)
+- **Python 3.10–3.12** — tested on 3.12
+- **cmake ≥ 3.15**, a C++14 compiler, **Eigen3**, **pybind11**, **OpenMP** — needed to build the FoundationPose `mycpp` C++ extension
+- **Blender** — BlenderProc wraps it for template rendering; BlenderProc downloads a self-contained Blender binary automatically on first run
+- **git** — needed to install `nvdiffrast` from GitHub
 
-If you like this project, check out related works from our group:
-- [GigaPose: Fast and Robust Novel Object Pose Estimation via One Correspondence (CVPR 2024)](https://github.com/nv-nguyen/gigaPose)
-- [NOPE: Novel Object Pose Estimation from a Single Image (CVPR 2024)](https://github.com/nv-nguyen/nope)
-- [Templates for 3D Object Pose Estimation Revisited: Generalization to New objects and Robustness to Occlusions (CVPR 2022)](https://github.com/nv-nguyen/template-pose) 
-- [PIZZA: A Powerful Image-only Zero-Shot Zero-CAD Approach to 6DoF Tracking (3DV 2022)](https://github.com/nv-nguyen/pizza)
-- [BOP visualization toolkit](https://github.com/nv-nguyen/bop_viz_kit)
+---
 
-## Updates:
-- 23/05/2024: Added [tutorial](https://github.com/nv-nguyen/cnos?tab=readme-ov-file#testing-on-bop-datasets-rocket) to run CNOS on [HOPE dataset](https://bop.felk.cvut.cz/datasets/) for [BOP challenge 2024](https://bop.felk.cvut.cz/challenges/bop-challenge-2024/).
-- 23/07/2023: Added [tutorial](https://github.com/nv-nguyen/cnos#testing-on-custom-datasets-rocket) to run CNOS on custom datasets
+## Installation
 
-## Installation :construction_worker:
+### 1. Clone the repository
 
-<details><summary>Click to expand</summary>
-
-Please make sure that you update this [user's configuration](https://github.com/nv-nguyen/cnos/blob/main/configs/user/default.yaml) before conducting any experiments. 
-
-### 1. Create conda environment
-```
-conda env create -f environment.yml
-conda activate cnos
-
-# for using SAM
-pip install git+https://github.com/facebookresearch/segment-anything.git
-
-# for using fastSAM
-pip install ultralytics==8.0.135
+```bash
+git clone <repo-url>
+cd cnos
 ```
 
-### 2. Datasets and model weights
+### 2. Install PyTorch (match CUDA version to your driver)
 
-#### 2.1. Download datasets from [BOP challenge](https://bop.felk.cvut.cz/datasets/):
-
-For [BOP challenge 2024](https://bop.felk.cvut.cz/challenges/bop-challenge-2024/) core datasets (HOPE, HANDAL, HOT-3D), download each dataset with the following command:
-```
-pip install -U "huggingface_hub[cli]"
-export DATASET_NAME=hope
-python -m src.scripts.download_bop_h3 dataset_name=$DATASET_NAME
-
-# For model-free tasks
-python -m src.scripts.download_modelfree_onboarding_bop_h3
+```bash
+# CUDA 12.4 example — check https://pytorch.org/get-started/locally/ for other versions
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 ```
 
+### 3. Install nvdiffrast (requires `nvcc` on PATH)
 
-For [BOP challenge 2023](https://bop.felk.cvut.cz/challenges/bop-challenge-2023/) core datasets (LMO, TLESS, TUDL, ICBIN, ITODD, HB, and TLESS), download all datasets with the following command:
-```
-python -m src.scripts.download_bop_classic
-```
-
-#### 2.2. Rendering templates with [Pyrender](https://github.com/mmatl/pyrender):
-Note: This rendering is fast. For example, using a single V100 GPU, it can be done within 10 minutes for seven core datasets of BOP'23. 
-
-For [BOP challenge 2024](https://bop.felk.cvut.cz/challenges/bop-challenge-2024/) core datasets (HOPE, HANDAL, HOT-3D), rendering templates with Pyrender is only required for model-based tasks, while for model-free tasks, you can skip this step since the images in onboarding videos can be used directly. To render templates for model-based tasks:
-```
-export DATASET_NAME=hope
-python -m src.scripts.render_template_with_pyrender dataset_name=$DATASET_NAME
-```
-For [BOP challenge 2023](https://bop.felk.cvut.cz/challenges/bop-challenge-2023/) core datasets (LMO, TLESS, TUDL, ICBIN, ITODD, HB, and TLESS), you can use the pre-rendered templates at [this Google Drive link (4.64GB)](https://drive.google.com/file/d/1yz2-q74PGws1OtDalX3ySo7AhiwWveK1/view?usp=sharing) and unzip it into $ROOT_DIR or render template from scratch with:
-```
-python -m src.scripts.render_template_with_pyrender
+```bash
+pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git
 ```
 
-#### 2.3. Download model weights of [Segmenting Anything](https://github.com/facebookresearch/segment-anything):
-```
-python -m src.scripts.download_sam
-```
+`nvcc` comes with the CUDA Toolkit (not just the driver). If it is not on PATH, set `CUDA_HOME` to your toolkit path (e.g. `/usr/local/cuda`) before running the above.
 
-#### 2.4. Download model weights of [Fast Segmenting Anything](https://github.com/CASIA-IVA-Lab/FastSAM):
-```
-python -m src.scripts.download_fastsam
+### 4. Install remaining dependencies
+
+```bash
+pip install -r requirements.txt
 ```
 
-#### 2.5. Download [BlenderProc4BOP](https://bop.felk.cvut.cz/datasets/) set:
-This is only required when you want to use realistic rendering with BlenderProc.
+### 5. Build the FoundationPose C++ extension
 
+FoundationPose uses a small C++ library (`mycpp`) for pose hypothesis clustering. Build it once:
 
-For [BOP challenge 2024](https://bop.felk.cvut.cz/challenges/bop-challenge-2024/) core datasets (HOPE, HANDAL, HOT-3D), this download is only required for model-based tasks:
-```
-pip install -U "huggingface_hub[cli]"
-export DATASET_NAME=hope
-python -m src.scripts.download_train_pbr_bop24 dataset_name=$DATASET_NAME
-```
-For [BOP challenge 2023](https://bop.felk.cvut.cz/challenges/bop-challenge-2023/) core datasets (LMO, TLESS, TUDL, ICBIN, ITODD, HB, and TLESS):
-```
-python -m src.scripts.download_train_pbr_bop23
+```bash
+cd FoundationPose-main/mycpp
+mkdir -p build && cd build
+cmake .. -DPYTHON_EXECUTABLE=$(which python)
+make -j$(nproc)
+cd ../../..
 ```
 
+If you are using a conda environment, you can alternatively run:
 
-</details>
-
-##  Testing on [BOP datasets](https://bop.felk.cvut.cz/datasets/) :rocket:
-
-We provide CNOS's predictions for three core dataset of [BOP challenge 2024](https://bop.felk.cvut.cz/challenges/bop-challenge-2024/) with SAM model and seven core dataset of [BOP challenge 2023](https://bop.felk.cvut.cz/challenges/bop-challenge-2023/) with both SAM and FastSAM models in [this link](https://drive.google.com/drive/folders/1yGRKpz1RI4h5-u0drusVeXPuAsg_GIO5?usp=sharing).
-
-<details><summary>Click to expand</summary>
-
-1. Run CNOS to get predictions:
-
-For [BOP challenge 2024](https://bop.felk.cvut.cz/challenges/bop-challenge-2023/) datasets:
-```
-export DATASET_NAME=hope
-# model-free tasks: with SAM + static onboarding
-python run_inference.py dataset_name=$DATASET_NAME model.onboarding_config.rendering_type=onboarding_static
-
-# model-free tasks: with SAM + dynamic onboarding
-python run_inference.py dataset_name=$DATASET_NAME model.onboarding_config.rendering_type=onboarding_dynamic
-
-# model-based tasks: with SAM + PBR
-python run_inference.py dataset_name=$DATASET_NAME model.onboarding_config.rendering_type=pbr
-
-# model-based tasks: with SAM + pyrender
-python run_inference.py dataset_name=$DATASET_NAME model.onboarding_config.rendering_type=pyrender
-```
-Quantitative results on HOPE (only RealSense testing images, BOP'19-23) and HOPE_v2 (both RealSense and Vicon testing images, BOP'24):
-
-| Dataset      | Task      | Static onboarding  | Dynamic onboarding | Model-based PBR  | Model-based Pyrender |
-|---------------|---------------|-----------|----------|-----------|----------|
-| HOPE  | 2D detection  | 39.8 | 40.8 | 41.6 | 39.3 |
-| HOPE_v2  | 2D detection  | 33.4 | 32.4 | 35.4 | 33.5 |
-| HOPE  | 2D segmentation  | 52.2 | 54.7 | 57.2 | 52.9 |
-| HOPE_v2  | 2D segmentation  | 43.5 | 43.4 | 47.5 | 44.9 |
-
-For [HOT3D](https://facebookresearch.github.io/hot3d/) datasets:
-```
-huggingface-cli download bop-benchmark/datasets --include "hot3d/object_models/*" --local-dir $DATASET_DIR --repo-type=dataset
-python -m src.scripts.render_template_with_pyrender dataset_name=hot3d
+```bash
+bash FoundationPose-main/build_all_conda.sh
 ```
 
-For [BOP challenge 2023](https://bop.felk.cvut.cz/challenges/bop-challenge-2023/) datasets:
-```
-export DATASET_NAME=lmo 
-# adding CUDA_VISIBLE_DEVICES=$GPU_IDS if you want to use a specific GPU
+### 6. Verify the build
 
-# with FastSAM + PBR
-python run_inference.py dataset_name=$DATASET_NAME model=cnos_fast
-
-# with FastSAM + PBR + denser viewpoints
-python run_inference.py dataset_name=$DATASET_NAME model=cnos_fast model.onboarding_config.level_templates=1
-
-# with FastSAM + PyRender
-python run_inference.py dataset_name=$DATASET_NAME model=cnos_fast model.onboarding_config.rendering_type=pyrender
-
-# with SAM + PyRender
-python run_inference.py dataset_name=$DATASET_NAME model.onboarding_config.rendering_type=pyrender
-
-# with SAM + PBR
-python run_inference.py dataset_name=$DATASET_NAME
-```
-After running this script, CNOS will output a prediction file at [this dir](https://github.com/nv-nguyen/cnos/blob/main/configs/run_inference.yaml#L9). You can then evaluate this prediction on [BOP challenge website](https://bop.felk.cvut.cz/).
-
-2. Visualize the predictions:
-
-There are two options:
-
-2.a. Using our custom visualization without Detectron2 (display only masks)
-
-```
-python -m src.scripts.visualize dataset_name=$DATASET_NAME input_file=$INPUT_FILE output_dir=$OUTPUT_DIR
+```bash
+python -c "
+import sys
+sys.path.insert(0, 'FoundationPose-main')
+import glob, pathlib
+so = list(pathlib.Path('FoundationPose-main/mycpp/build').glob('mycpp*.so'))
+print('mycpp OK:', so[0].name if so else 'NOT FOUND')
+"
 ```
 
-2.b. Using Detectron2 (display both masks, objectID, scores)
-```
-python -m pip install 'git+https://github.com/facebookresearch/detectron2.git'
-python -m src.scripts.visualize_detectron2 dataset_name=$DATASET_NAME input_file=$INPUT_FILE output_dir=$OUTPUT_DIR
-```
+---
 
-</details>
+## Running the Notebook
 
-##  Testing on custom datasets :rocket:
-
-You can run CNOS on your custom dataset given a RGB image and the CAD model of the target object. We provide an example of running CNOS on "BBQ sauce" sample taken from [MegaPose](https://github.com/megapose6d/megapose6d).
-
-![qualitative](./media/demo/result.png)
-
-<details><summary>Click to expand</summary>
-
-There are two steps to test CNOS on your own dataset:
-
-0. Define the path to your dataset:
-```
-export CAD_PATH=./media/demo/hope_000002.ply
-export RGB_PATH=./media/demo/bba_sauce_rgb.png
-export OUTPUT_DIR=./tmp/custom_dataset
+```bash
+jupyter notebook sam6d_example.ipynb
 ```
 
-1. Render the template from CAD models:
+In the **Configuration** cell, update these two variables:
+
+| Variable | Description |
+|----------|-------------|
+| `CAD_PATH` | Path to your object's CAD file (`.ply`, `.stl`, `.obj`, …) |
+| `DEPTH_SCALE` | Multiply raw depth pixels → mm. Use `1.0` if depth is already in mm, `1000.0` for uint16 RealSense depth |
+
+Everything else (model weight downloads, template rendering, descriptor caching) happens automatically on first run.
+
+---
+
+## Model Weights
+
+All weights are auto-downloaded on the first run. Locations after download:
+
+| Weight | Size | Path |
+|--------|------|------|
+| SAM ViT-H | ~2.5 GB | `SAM-6D-main/SAM-6D/Instance_Segmentation_Model/checkpoints/segment-anything/` |
+| DINOv2 ViT-L/14 | ~1.2 GB | `SAM-6D-main/SAM-6D/Instance_Segmentation_Model/checkpoints/dinov2/` |
+| SAM-6D PEM | ~300 MB | `SAM-6D-main/SAM-6D/Pose_Estimation_Model/checkpoints/` |
+| MAE ViT-Base backbone | included | `checkpoints/mae_pretrain_vit_base.pth` |
+| FoundationPose refiner | ~150 MB | `FoundationPose-main/weights/2023-10-28-18-33-37/` |
+| FoundationPose scorer | ~150 MB | `FoundationPose-main/weights/2024-01-11-20-02-45/` |
+
+SAM and DINOv2 download via `wget`. PEM and FoundationPose weights download via `gdown` from Google Drive.
+
+**If gdown fails (Google Drive quota exceeded)**, download manually:
+
+- **SAM-6D PEM**: `gdown 1joW9IvwsaRJYxoUmGo68dBVg-HcFNyI7 -O <pem-path>`
+- **FoundationPose weights**: https://drive.google.com/drive/folders/1DFezOAD0oD1BblsXVxqDsl8fj0qzB82i  
+  Place the `2023-10-28-18-33-37` and `2024-01-11-20-02-45` folders under `FoundationPose-main/weights/`.
+
+---
+
+## Template Rendering
+
+On first run, `SAM6D` renders 42 BlenderProc views of your CAD model into:
+
 ```
-bash ./src/scripts/render_custom.sh
+sam6d_templates/<mesh_stem>/templates/
 ```
-If the quality of rendering is not good, you can try to ajust the lightning conditions and distance between the camera and the object in [this script](https://github.com/nv-nguyen/cnos/tree/main/src/scripts/render_custom.sh).
 
-2. Run CNOS and visualize the results:
+This takes ~1–2 minutes and requires BlenderProc (installed via `requirements.txt`). Subsequent runs skip rendering because the outputs are cached. Pass `reset_templates=True` to `SAM6D(...)` to force a re-render.
+
+---
+
+## Repository Structure
+
 ```
-bash ./src/scripts/run_inference_custom.sh
+sam6d_example.ipynb       # End-to-end usage notebook
+requirements.txt          # Python dependencies
+src/
+  sam6d.py                # SAM6D class — ISM + PEM wrapper
+  foundationpose.py       # FoundationPoseRefiner class
+SAM-6D-main/              # SAM-6D source (do not modify)
+FoundationPose-main/      # FoundationPose source (do not modify)
+checkpoints/              # MAE ViT-Base backbone checkpoint (tracked in git)
 ```
-The detections will be saved at $OUTPUT_DIR/cnos_results. This script is used by default for single-CAD object segmentation. If you want to segment multiple objects, please make few adaptations [this script](https://github.com/nv-nguyen/cnos/tree/main/src/scripts/inference_custom.py).
 
-</details>
+---
 
-Tricks and tips to improve results when running on custom objects with the sample taken from [jakob-ropers-snkeos](https://github.com/jakob-ropers-snkeos).
+## Troubleshooting
 
-![tips](./media/demo2/result.png)
+**`mycpp C++ extension not found`**  
+Run the cmake/make build step (Section 5 above). If Python version changes, rebuild.
 
-<details><summary>Click to expand</summary>
-
-
-Please note that SAM or FastSAM can perform exceptionally well, even on very small objects. However, certain parameters from the original implementation require adjustments to achieve optimal results. For example, it is recommended to reduce the default stability_score_thresh value of 0.97 to smaller settings, like 0.5 (applied after step 1 of rendering).
+**`BlenderProc rendering failed`**  
+Run the render command manually to see Blender's error output:
+```bash
+blenderproc run SAM-6D-main/SAM-6D/Render/render_custom_templates.py \
+  --output_dir ./sam6d_templates --cad_path <your-cad-file>
 ```
-python -m src.scripts.inference_custom --template_dir $OUTPUT_DIR --rgb_path $RGB_PATH --stability_score_thresh 0.5
-```
-</details>
 
-## Acknowledgement
+**`gdown` quota / download failure**  
+Download weights manually using the links in the Model Weights section above.
 
-The code is adapted from [Nope](https://github.com/nv-nguyen/nope), [Segmenting Anything](https://github.com/facebookresearch/segment-anything), [DINOv2](https://github.com/facebookresearch/dinov2). 
+**CUDA out of memory**  
+Reduce `points_per_side` (fewer SAM proposals) or `n_template_view` in the `SAM6D(...)` constructor.
 
-## Contact
-If you have any question, feel free to create an issue or contact the first author at van-nguyen.nguyen@enpc.fr
+**Depth looks wrong / no detections**  
+Check `DEPTH_SCALE`. For a RealSense camera streaming uint16 depth in mm, use `DEPTH_SCALE=1000.0` (converts the `0.0–0.2` raw range to `0–200` mm). For depth already in mm, use `1.0`.
+
+---
+
+## Credits
+
+- [SAM-6D](https://github.com/JiehongLin/SAM-6D) — Lin et al., CVPR 2024
+- [FoundationPose](https://github.com/NVlabs/FoundationPose) — Wen et al., CVPR 2024 (Highlight)
+- [Segment Anything (SAM)](https://github.com/facebookresearch/segment-anything) — Kirillov et al., ICCV 2023
+- [DINOv2](https://github.com/facebookresearch/dinov2) — Oquab et al., TMLR 2024
