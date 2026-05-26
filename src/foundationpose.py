@@ -43,6 +43,10 @@ class FoundationPoseRefiner:
         min_pose_score: float = 0.0,
         debug: int = 0,
         debug_dir: Optional[Union[str, Path]] = None,
+
+        # Memory management
+        half_precision: bool = False,
+        lazy_load: bool = False,
     ):
         """
         Args:
@@ -94,13 +98,12 @@ class FoundationPoseRefiner:
         self._mesh_scale = mesh_scale
         logging.info(f"Mesh loaded: {len(mesh.vertices)} vertices, diameter≈{mesh.bounding_box.extents.max():.4f} m.")
 
-        logging.info("Loading PoseRefinePredictor ...")
-        from learning.training.predict_pose_refine import PoseRefinePredictor
-        self._refiner = PoseRefinePredictor()
-        logging.info("Loading ScorePredictor ...")
-        from learning.training.predict_score import ScorePredictor
-        self._scorer = ScorePredictor()
-        logging.info("FoundationPose models loaded.")
+        self._half_precision = half_precision
+        self._lazy_load = lazy_load
+        self._refiner = None
+        self._scorer = None
+        if not lazy_load:
+            self._load_models()
 
         # Import internal FoundationPose class under an alias to avoid name clash
         _est_mod = importlib.import_module("estimater")
@@ -151,8 +154,25 @@ class FoundationPoseRefiner:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _load_models(self):
+        """Load PoseRefinePredictor and ScorePredictor onto GPU (idempotent)."""
+        if self._refiner is None:
+            logging.info("Loading PoseRefinePredictor ...")
+            from learning.training.predict_pose_refine import PoseRefinePredictor
+            self._refiner = PoseRefinePredictor()
+            if self._half_precision:
+                self._refiner.model.half()
+        if self._scorer is None:
+            logging.info("Loading ScorePredictor ...")
+            from learning.training.predict_score import ScorePredictor
+            self._scorer = ScorePredictor()
+            if self._half_precision:
+                self._scorer.model.half()
+        logging.info("FoundationPose models loaded.")
+
     def _make_estimator(self):
         """Create a fresh internal FoundationPose estimator, lazily init glctx."""
+        self._load_models()
         if self._glctx is None:
             import nvdiffrast.torch as dr
             self._glctx = dr.RasterizeCudaContext()

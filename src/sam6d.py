@@ -82,6 +82,11 @@ class SAM6D:
         pem_n_sample_observed: int = 2048,
         pem_n_sample_model: int = 1024,
         pem_rgb_mask_flag: bool = True,
+
+        # Memory management
+        half_precision: bool = False,  # fp16 for SAM + DINOv2 only (~1.8 GB saved); PEM stays fp32 (CUDA SVD not supported in fp16)
+        auto_offload: bool = False,
+        empty_cache_between_stages: bool = False,
     ):
         _ensure_sam6d_paths()
 
@@ -99,6 +104,9 @@ class SAM6D:
         self.pem_n_sample_observed = pem_n_sample_observed
         self.pem_n_sample_model = pem_n_sample_model
         self.pem_rgb_mask_flag = pem_rgb_mask_flag
+        self._half_precision = half_precision
+        self._auto_offload = auto_offload
+        self._empty_cache = empty_cache_between_stages
 
         self.template_dir = Path(template_dir) if template_dir else Path("./sam6d_templates") / self.cad_path.stem
         self.template_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +147,8 @@ class SAM6D:
         logging.info(f"Loading SAM ({sam_model_type}) ...")
         sam = sam_model_registry[sam_model_type](checkpoint=str(_sam_path))
         sam.to(device=self.device)
+        if half_precision:
+            sam.half()
         self.segmentor = CustomSamAutomaticMaskGenerator(
             sam=sam,
             stability_score_thresh=stability_score_thresh,
@@ -159,6 +169,8 @@ class SAM6D:
         )
         self.descriptor.model = self.descriptor.model.to(self.device)
         self.descriptor.model.device = self.device
+        if half_precision:
+            self.descriptor.model.half()
         logging.info("DINOv2 loaded.")
 
         self._similarity = PairwiseSimilarity(metric="cosine", chunk_size=16)
@@ -181,6 +193,8 @@ class SAM6D:
         self.pem.eval()
         gorilla.solver.load_checkpoint(model=self.pem, filename=str(_pem_path))
         logging.info("PEM loaded.")
+        # PEM stays in fp32: CUDA batched SVD (used in the pose solver) is not
+        # implemented for fp16, so half_precision does not apply here.
 
         # --- Pre-compute PEM template features ---
         logging.info("Extracting PEM template features ...")
@@ -243,6 +257,45 @@ class SAM6D:
                 "Download manually with gdown ID: 1joW9IvwsaRJYxoUmGo68dBVg-HcFNyI7\n"
                 f"Place at: {target}"
             )
+
+    # ------------------------------------------------------------------
+    # Memory management
+    # ------------------------------------------------------------------
+
+    def offload_to_cpu(self):
+        """Move all GPU-resident models and tensors to CPU to free VRAM.
+
+        Call this after SAM6D.forward() completes and before running FoundationPose
+        (or any other VRAM-intensive stage) to reclaim the ~5 GB held by SAM, DINOv2,
+        and PEM. Use reload_to_gpu() to bring everything back before the next forward().
+        """
+        self.segmentor.predictor.model.cpu()
+        self.descriptor.model.cpu()
+        self.pem.cpu()
+        for k, v in self.ref_data.items():
+            if isinstance(v, torch.Tensor):
+                self.ref_data[k] = v.cpu()
+        if hasattr(self, "all_tem_pts"):
+            self.all_tem_pts = self.all_tem_pts.cpu()
+        if hasattr(self, "all_tem_feat"):
+            self.all_tem_feat = self.all_tem_feat.cpu()
+        torch.cuda.empty_cache()
+
+    def reload_to_gpu(self):
+        """Reload CPU-offloaded models back to the configured CUDA device.
+
+        Reverses offload_to_cpu() so that forward() can run again.
+        """
+        self.segmentor.predictor.model.to(self.device)
+        self.descriptor.model.to(self.device)
+        self.pem.to(self.device)
+        for k, v in self.ref_data.items():
+            if isinstance(v, torch.Tensor):
+                self.ref_data[k] = v.to(self.device)
+        if hasattr(self, "all_tem_pts"):
+            self.all_tem_pts = self.all_tem_pts.to(self.device)
+        if hasattr(self, "all_tem_feat"):
+            self.all_tem_feat = self.all_tem_feat.to(self.device)
 
     # ------------------------------------------------------------------
     # Template rendering
@@ -322,7 +375,8 @@ class SAM6D:
             descriptors = torch.load(desc_cache, map_location=self.device)
         else:
             logging.info("Computing ISM semantic descriptors ...")
-            descriptors = self.descriptor.compute_features(templates_proc, token_name="x_norm_clstoken")
+            with torch.autocast("cuda", enabled=self._half_precision):
+                descriptors = self.descriptor.compute_features(templates_proc, token_name="x_norm_clstoken")
             torch.save(descriptors, desc_cache)
         # Shape: [1, N_templates, D]  (1 object)
         self.ref_data["descriptors"] = descriptors.unsqueeze(0)
@@ -332,9 +386,10 @@ class SAM6D:
             appe_descriptors = torch.load(appe_cache, map_location=self.device)
         else:
             logging.info("Computing ISM appearance descriptors ...")
-            appe_descriptors = self.descriptor.compute_masked_patch_feature(
-                templates_proc, masks_proc[:, 0, :, :]
-            )
+            with torch.autocast("cuda", enabled=self._half_precision):
+                appe_descriptors = self.descriptor.compute_masked_patch_feature(
+                    templates_proc, masks_proc[:, 0, :, :]
+                )
             torch.save(appe_descriptors, appe_cache)
         # Shape: [1, N_templates, N_patches, D]  (1 object)
         self.ref_data["appe_descriptors"] = appe_descriptors.unsqueeze(0)
@@ -610,7 +665,10 @@ class SAM6D:
         depth_m = depth.astype(np.float32) * depth_scale / 1000.0
 
         # ---- ISM: proposal generation ----
-        proposals = self.segmentor.generate_masks(rgb_np)
+        with torch.autocast("cuda", enabled=self._half_precision):
+            proposals = self.segmentor.generate_masks(rgb_np)
+        if self._empty_cache:
+            torch.cuda.empty_cache()
         detections = self._Detections(proposals)
 
         if len(detections.masks) == 0:
@@ -619,7 +677,10 @@ class SAM6D:
         if self.min_component_area_ratio > 0:
             detections = self._clean_mask_components(detections)
 
-        query_cls, query_appe = self.descriptor.forward(rgb_np, detections)
+        with torch.autocast("cuda", enabled=self._half_precision):
+            query_cls, query_appe = self.descriptor.forward(rgb_np, detections)
+        if self._empty_cache:
+            torch.cuda.empty_cache()
 
         idx_selected, pred_idx_objects, semantic_score, best_template = (
             self._compute_semantic_score(query_cls)
@@ -727,6 +788,8 @@ class SAM6D:
 
         with torch.no_grad():
             out = self.pem(input_data)
+        if self._empty_cache:
+            torch.cuda.empty_cache()
 
         det_scores = input_data["score"]
         pose_scores_t = out.get("pred_pose_score", det_scores) * det_scores
@@ -760,6 +823,8 @@ class SAM6D:
             pred_t      = pred_t[keep_idx]
             poses       = [poses[i] for i in keep_idx]
 
+        if self._auto_offload:
+            self.offload_to_cpu()
         return {
             "poses":             poses,
             "masks":             final_masks,
@@ -776,6 +841,8 @@ class SAM6D:
         }
 
     def _empty_result(self, H: int, W: int) -> Dict[str, Any]:
+        if self._auto_offload:
+            self.offload_to_cpu()
         return {
             "poses":             [],
             "masks":             np.zeros((0, H, W), dtype=bool),
