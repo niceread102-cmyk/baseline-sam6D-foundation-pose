@@ -607,9 +607,9 @@ def compute_crop_window_tf_batch(pts=None, H=None, W=None, poses=None, K=None, c
                         radius,0,0,
                         -radius,0,0,
                         0,radius,0,
-                        0,-radius,0]).reshape(-1,3)
-    pts = poses[:,:3,3].reshape(-1,1,3)+offsets.reshape(1,-1,3)
-    K = torch.as_tensor(K)
+                        0,-radius,0], dtype=torch.float32, device='cuda').reshape(-1,3)
+    pts = torch.as_tensor(poses[:,:3,3], dtype=torch.float32, device='cuda').reshape(-1,1,3)+offsets.reshape(1,-1,3)
+    K = torch.as_tensor(K, dtype=torch.float32, device='cuda')
     projected = (K@pts.reshape(-1,3).T).T
     uvs = projected[:,:2]/projected[:,2:3]
     uvs = uvs.reshape(B, -1, 2)

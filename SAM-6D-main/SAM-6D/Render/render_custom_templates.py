@@ -36,12 +36,12 @@ def get_norm_info(mesh_path):
     model_points = trimesh.sample.sample_surface(mesh, 1024)[0]
     model_points = model_points.astype(np.float32)
 
-    min_value = np.min(model_points, axis=0)
-    max_value = np.max(model_points, axis=0)
+    # Measure radius from the centroid so off-origin meshes scale correctly
+    centroid = (model_points.max(axis=0) + model_points.min(axis=0)) / 2.0
+    centered = model_points - centroid
+    radius = float(np.max(np.linalg.norm(centered, axis=1)))
 
-    radius = max(np.linalg.norm(max_value), np.linalg.norm(min_value))
-
-    return 1/(2*radius)
+    return 1 / (2 * radius)
 
 
 # load cnos camera pose
@@ -61,6 +61,11 @@ for idx, cam_pose in enumerate(cam_poses):
     obj = bproc.loader.load_obj(args.cad_path)[0]
     obj.set_scale([scale, scale, scale])
     obj.set_cp("category_id", 1)
+
+    # Center mesh centroid at world origin so the camera (looking at origin) sees it properly
+    mesh_tri = trimesh.load(args.cad_path, force='mesh')
+    centroid = mesh_tri.bounding_box.centroid
+    obj.set_location([-scale * centroid[0], -scale * centroid[1], -scale * centroid[2]])
 
     # assigning material colors to untextured objects
     if args.mesh_color is not None:

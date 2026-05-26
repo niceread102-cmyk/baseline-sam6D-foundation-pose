@@ -327,9 +327,11 @@ class SAM6D:
         index_templates = load_index_level_in_level2(0, "all")
         self.ref_data["poses"] = poses[index_templates, :, :]   # [N_level0, 4, 4]
 
-        # Object point cloud sampled from CAD mesh
+        # Object point cloud sampled from CAD mesh, centered to match renderer
         mesh = trimesh.load_mesh(str(self.cad_path))
         model_pts = mesh.sample(2048).astype(np.float32) / 1000.0
+        mesh_centroid = np.array(mesh.bounding_box.centroid, dtype=np.float32) / 1000.0
+        model_pts = model_pts - mesh_centroid
         self.ref_data["pointcloud"] = torch.tensor(model_pts).unsqueeze(0).to(self.device)  # [1, N, 3]
 
         logging.info(
@@ -536,6 +538,9 @@ class SAM6D:
         y2x2 = torch.max(image_uv, dim=1).values
         xyxy = torch.cat([y1x1, y2x2], dim=-1)
         iou = self._compute_iou(xyxy, detections.boxes)
+        # compute_iou returns 0.0 (float) when boxes don't intersect; normalise to tensor
+        if not isinstance(iou, torch.Tensor):
+            iou = torch.full((xyxy.shape[0],), float(iou), dtype=torch.float32, device=xyxy.device)
         return iou, visible_ratio
 
     # ------------------------------------------------------------------
