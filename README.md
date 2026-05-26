@@ -112,11 +112,11 @@ All weights are auto-downloaded on the first run. Locations after download:
 | SAM ViT-H | ~2.5 GB | `SAM-6D-main/SAM-6D/Instance_Segmentation_Model/checkpoints/segment-anything/` |
 | DINOv2 ViT-L/14 | ~1.2 GB | `SAM-6D-main/SAM-6D/Instance_Segmentation_Model/checkpoints/dinov2/` |
 | SAM-6D PEM | ~300 MB | `SAM-6D-main/SAM-6D/Pose_Estimation_Model/checkpoints/` |
-| MAE ViT-Base backbone | included | `checkpoints/mae_pretrain_vit_base.pth` |
+| MAE ViT-Base backbone | ~330 MB | `checkpoints/mae_pretrain_vit_base.pth` |
 | FoundationPose refiner | ~150 MB | `FoundationPose-main/weights/2023-10-28-18-33-37/` |
 | FoundationPose scorer | ~150 MB | `FoundationPose-main/weights/2024-01-11-20-02-45/` |
 
-SAM and DINOv2 download via `wget`. PEM and FoundationPose weights download via `gdown` from Google Drive.
+SAM, DINOv2, and MAE download via `wget`. PEM and FoundationPose weights download via `gdown` from Google Drive.
 
 **If gdown fails (Google Drive quota exceeded)**, download manually:
 
@@ -148,7 +148,7 @@ src/
   foundationpose.py       # FoundationPoseRefiner class
 SAM-6D-main/              # SAM-6D source (do not modify)
 FoundationPose-main/      # FoundationPose source (do not modify)
-checkpoints/              # MAE ViT-Base backbone checkpoint (tracked in git)
+checkpoints/              # MAE ViT-Base backbone checkpoint (auto-downloaded)
 ```
 
 ---

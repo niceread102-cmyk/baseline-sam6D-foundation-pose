@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from PIL import Image
 
-_SAM6D_ROOT = Path(__file__).resolve().parent.parent / "SAM-6D-main" / "SAM-6D"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SAM6D_ROOT = _REPO_ROOT / "SAM-6D-main" / "SAM-6D"
 _ISM_ROOT = _SAM6D_ROOT / "Instance_Segmentation_Model"
 _PEM_ROOT = _SAM6D_ROOT / "Pose_Estimation_Model"
 
@@ -120,6 +121,7 @@ class SAM6D:
         self._maybe_download_sam(sam_checkpoint, sam_model_type, _ism_ckpt)
         self._maybe_download_dinov2(dinov2_checkpoint_dir, _ism_ckpt)
         self._maybe_download_pem(pem_checkpoint, _pem_ckpt)
+        self._maybe_download_mae(_REPO_ROOT / "checkpoints")
 
         _sam_path = Path(sam_checkpoint) if sam_checkpoint else _ism_ckpt / "segment-anything" / SAM_WEIGHTS[sam_model_type][0]
         _dinov2_dir = Path(dinov2_checkpoint_dir) if dinov2_checkpoint_dir else _ism_ckpt / "dinov2"
@@ -255,6 +257,21 @@ class SAM6D:
             raise RuntimeError(
                 f"Failed to download SAM-6D PEM checkpoint (exit {ret}).\n"
                 "Download manually with gdown ID: 1joW9IvwsaRJYxoUmGo68dBVg-HcFNyI7\n"
+                f"Place at: {target}"
+            )
+
+    def _maybe_download_mae(self, save_dir):
+        target = Path(save_dir) / "mae_pretrain_vit_base.pth"
+        if target.exists():
+            return
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        url = "https://dl.fbaipublicfiles.com/mae/pretrain/mae_pretrain_vit_base.pth"
+        logging.info("Downloading MAE ViT-Base backbone ...")
+        ret = os.system(f"wget -q -O '{target}' '{url}' --no-check-certificate")
+        if ret != 0 or not target.exists():
+            raise RuntimeError(
+                f"Failed to download MAE ViT-Base backbone (exit {ret}).\n"
+                f"Download manually: {url}\n"
                 f"Place at: {target}"
             )
 
