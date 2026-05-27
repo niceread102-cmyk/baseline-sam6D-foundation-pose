@@ -16,9 +16,9 @@ See `sam6d_example.ipynb` for a full end-to-end walkthrough.
 
 ## System Prerequisites
 
-- **CUDA 11.8+** — tested on CUDA 12.9 (sm_86 / RTX A6000)
+- **CUDA 11.8+** — tested on CUDA 12.9 (sm_86 / RTX A6000) and CUDA 13.0 (sm_121 / NVIDIA GB10 Spark)
 - **Python 3.10–3.12** — tested on 3.12
-- **cmake ≥ 3.15**, a C++14 compiler, **Eigen3**, **pybind11**, **OpenMP** — needed to build the FoundationPose `mycpp` C++ extension
+- **cmake ≥ 3.15**, a C++14 compiler, **Eigen3**, **pybind11**, **OpenMP** — needed to build the FoundationPose `mycpp` C++ extension (on ARM/Spark, Eigen3 and pybind11 can be installed without sudo — see [ARM Notes](#arm--nvidia-spark-notes))
 - **Blender** — BlenderProc wraps it for template rendering; BlenderProc downloads a self-contained Blender binary automatically on first run
 - **git** — needed to install `nvdiffrast` from GitHub
 
@@ -40,6 +40,12 @@ cd cnos
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 ```
 
+**NVIDIA Spark / ARM aarch64 (CUDA 13.0):** PyTorch publishes ARM64 wheels with CUDA support. Use the `cu130` index:
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+```
+This installs `torch 2.12.0+cu130` and `torchvision 0.27.0+cu130` for Python 3.12 aarch64.
+
 ### 3. Install nvdiffrast (requires `nvcc` on PATH)
 
 ```bash
@@ -48,10 +54,21 @@ pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git
 
 `nvcc` comes with the CUDA Toolkit (not just the driver). If it is not on PATH, set `CUDA_HOME` to your toolkit path (e.g. `/usr/local/cuda`) before running the above.
 
+**NVIDIA Spark / ARM:** Set both `CUDA_HOME` and the target architecture:
+```bash
+CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST="12.1" \
+  pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git
+```
+
 ### 4. Install remaining dependencies
 
 ```bash
 pip install -r requirements.txt
+```
+
+**NVIDIA Spark / ARM — `open3d` has no ARM64 wheel.** A minimal stub is provided in the virtualenv instead (see [ARM Notes](#arm--nvidia-spark-notes) below). Install everything else with:
+```bash
+grep -v '^open3d' requirements.txt | pip install -r /dev/stdin
 ```
 
 ### 5. Build the FoundationPose C++ extension
@@ -70,6 +87,31 @@ If you are using a conda environment, you can alternatively run:
 
 ```bash
 bash FoundationPose-main/build_all_conda.sh
+```
+
+**NVIDIA Spark / ARM — Eigen3 and pybind11 must be provided explicitly** (system packages require sudo):
+```bash
+# 1. Install pybind11 into the virtualenv
+pip install pybind11
+
+# 2. Download and install Eigen3 headers locally (header-only, no sudo needed)
+cd /tmp
+wget https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz -O eigen.tar.gz
+tar xzf eigen.tar.gz
+cd eigen-3.4.0 && mkdir build && cd build
+cmake .. -DCMAKE_INSTALL_PREFIX=/tmp/eigen-install
+make install
+cd <back-to-repo-root>
+
+# 3. Build mycpp pointing at local pybind11 and Eigen3
+PYBIND11_CMAKE=$(python -c "import pybind11; print(pybind11.get_cmake_dir())")
+cd FoundationPose-main/mycpp && mkdir -p build && cd build
+cmake .. \
+  -DPYTHON_EXECUTABLE=$(which python) \
+  -Dpybind11_DIR=$PYBIND11_CMAKE \
+  -DEigen3_DIR=/tmp/eigen-install/share/eigen3/cmake
+make -j$(nproc)
+cd ../../..
 ```
 
 ### 6. Verify the build
@@ -150,6 +192,43 @@ SAM-6D-main/              # SAM-6D source (do not modify)
 FoundationPose-main/      # FoundationPose source (do not modify)
 checkpoints/              # MAE ViT-Base backbone checkpoint (auto-downloaded)
 ```
+
+---
+
+## ARM / NVIDIA Spark Notes
+
+Tested on **NVIDIA Spark** (GB10 GPU, ARM Grace CPU, CUDA 13.0, sm_121, aarch64).
+
+### open3d stub
+
+`open3d` has no ARM64 wheel on PyPI and building from source requires `gfortran` + OpenGL dev headers (not available without sudo on the Spark). A lightweight Python stub is provided instead, placed directly into the virtualenv's `site-packages/open3d/`. It implements the exact subset of the `open3d` API used by FoundationPose:
+
+| Symbol | Implementation |
+|--------|----------------|
+| `o3d.geometry.PointCloud` | Pure numpy, including `voxel_down_sample` |
+| `o3d.utility.Vector3dVector` | Thin numpy array wrapper |
+| `o3d.io.write_point_cloud` | Delegates to `trimesh.export()` |
+| `o3d.io.read_point_cloud` | Delegates to `trimesh.load()` |
+
+To install the stub in a new virtualenv, copy the four files from a working environment:
+```bash
+# Copy from an existing torch_obj_tracking venv:
+cp -r ~/.virtualenvs/torch_obj_tracking/lib/python3.12/site-packages/open3d \
+       <your-new-venv>/lib/python3.12/site-packages/
+```
+
+Or recreate it from the source tree (all four files live under `site-packages/open3d/`).
+
+### CUDA version mismatch with nvdiffrast
+
+If nvdiffrast's build fails with a CUDA version mismatch error, make sure your PyTorch matches the system CUDA toolkit version (`torch.version.cuda` should equal the output of `nvcc --version`). On the Spark this means using the `cu130` index (CUDA 13.0).
+
+### PyTorch index for ARM + CUDA
+
+| System CUDA | pip index URL |
+|-------------|--------------|
+| 12.8 | `https://download.pytorch.org/whl/cu128` |
+| 13.0 (Spark) | `https://download.pytorch.org/whl/cu130` |
 
 ---
 
