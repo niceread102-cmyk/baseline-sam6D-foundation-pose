@@ -21,10 +21,22 @@ def _ensure_fp_paths():
             sys.path.insert(0, p)
 
 
+def _broadcast_thresh(val, M, default=None):
+    if val is None:
+        return [default] * M
+    if isinstance(val, (int, float)):
+        return [val] * M
+    assert len(val) == M, f"Expected length {M}, got {len(val)}"
+    return list(val)
+
+
 class FoundationPoseRefiner:
     """
     Wraps the FoundationPose estimator (estimater.py) to accept SAM-6D output dicts
     and run pose registration (first frame) and tracking (subsequent frames).
+
+    Supports an arbitrary number M of CAD model types simultaneously. All FoundationPose
+    neural network weights (RefineNet, ScoreNet, glctx) are loaded once and shared.
 
     Requires CUDA; CPU-only mode is not supported by FoundationPose.
     The mycpp C++ extension must be compiled before use (see FoundationPose-main/build_all.sh).
@@ -33,14 +45,16 @@ class FoundationPoseRefiner:
 
     def __init__(
         self,
-        cad_path: Union[str, Path],
+        cad_path: Union[str, Path, List[Union[str, Path]]],
+        model_ids: Optional[List[str]] = None,
         device: str = "cuda",
         weights_dir: Optional[Union[str, Path]] = None,
         mesh_scale: float = 1.0 / 1000.0,
         est_refine_iter: int = 5,
         track_refine_iter: int = 2,
         max_detections: Optional[int] = None,
-        min_pose_score: float = 0.0,
+        min_pose_score: Union[float, List[float]] = 0.0,
+        max_detections_per_model: Optional[Union[int, List[Optional[int]]]] = None,
         debug: int = 0,
         debug_dir: Optional[Union[str, Path]] = None,
 
@@ -50,7 +64,9 @@ class FoundationPoseRefiner:
     ):
         """
         Args:
-            cad_path: Path to the CAD mesh file (.obj, .stl, .ply, …).
+            cad_path: Path to one CAD mesh file, or a list of M paths for M model types.
+            model_ids: Optional names for each model (defaults to file stems). Length must
+                match cad_path if provided.
             device: Must be "cuda" — FoundationPose is CUDA-only.
             weights_dir: Where to find (or download) model weights. Defaults to
                 FoundationPose-main/weights/, which is the path hardcoded in
@@ -60,8 +76,12 @@ class FoundationPoseRefiner:
                 if your mesh is already in metres.
             est_refine_iter: Refinement iterations for register() (default 5).
             track_refine_iter: Refinement iterations for track_one() (default 2).
-            max_detections: Max SAM-6D detections to process per call (None = all).
+            max_detections: Global cap on detections to process per refine_from_sam6d()
+                call (applied after per-model filtering). None = no global cap.
             min_pose_score: Skip SAM-6D detections below this pose_score threshold.
+                Scalar (same for all models) or list of length M (per-model).
+            max_detections_per_model: Cap per model type. Scalar, list of length M,
+                or None (no cap per model).
             debug: Debug verbosity 0–3 (passed to internal FoundationPose estimator).
             debug_dir: Directory for debug visualizations (if debug >= 2).
         """
@@ -70,12 +90,28 @@ class FoundationPoseRefiner:
                 "FoundationPose requires CUDA. CPU-only mode is not supported."
             )
 
-        self.cad_path = Path(cad_path)
+        # Normalize cad_path to list
+        if isinstance(cad_path, (str, Path)):
+            cad_paths = [Path(cad_path)]
+        else:
+            cad_paths = [Path(p) for p in cad_path]
+        M = len(cad_paths)
+
+        self._cad_paths = cad_paths
+        self.cad_path = cad_paths[0]  # backward compat
+        self._model_ids = model_ids if model_ids is not None else [p.stem for p in cad_paths]
+        assert len(self._model_ids) == M, (
+            f"model_ids length {len(self._model_ids)} must match cad_path count {M}"
+        )
+
         self.device = device
         self.est_refine_iter = est_refine_iter
         self.track_refine_iter = track_refine_iter
         self.max_detections = max_detections
-        self.min_pose_score = min_pose_score
+        self._min_pose_score = _broadcast_thresh(min_pose_score, M)
+        self._max_det_per_model = _broadcast_thresh(max_detections_per_model, M, default=None)
+        # backward compat scalar alias
+        self.min_pose_score = self._min_pose_score[0]
         self.debug = debug
         self.debug_dir = str(debug_dir) if debug_dir else "/tmp/foundationpose_debug"
         if self.debug >= 2:
@@ -88,15 +124,22 @@ class FoundationPoseRefiner:
         self._maybe_download_weights(_weights_dir)
 
         import trimesh
-        logging.info(f"Loading mesh from {self.cad_path} (mesh_scale={mesh_scale}) ...")
-        mesh = trimesh.load(str(self.cad_path), force="mesh")
-        mesh.vertices = mesh.vertices * mesh_scale  # convert to metres for FoundationPose
-        mesh.process(validate=True)
-        if len(mesh.vertex_normals) == 0:
-            mesh = mesh.smoothed()
-        self._mesh = mesh
+        self._meshes: List = []
+        for cp in cad_paths:
+            logging.info(f"Loading mesh from {cp} (mesh_scale={mesh_scale}) ...")
+            mesh = trimesh.load(str(cp), force="mesh")
+            mesh.vertices = mesh.vertices * mesh_scale
+            mesh.process(validate=True)
+            if len(mesh.vertex_normals) == 0:
+                mesh = mesh.smoothed()
+            self._meshes.append(mesh)
+            logging.info(
+                f"Mesh loaded: {len(mesh.vertices)} vertices, "
+                f"diameter≈{mesh.bounding_box.extents.max():.4f} m."
+            )
+        # backward compat alias
+        self._mesh = self._meshes[0]
         self._mesh_scale = mesh_scale
-        logging.info(f"Mesh loaded: {len(mesh.vertices)} vertices, diameter≈{mesh.bounding_box.extents.max():.4f} m.")
 
         self._half_precision = half_precision
         self._lazy_load = lazy_load
@@ -109,8 +152,9 @@ class FoundationPoseRefiner:
         _est_mod = importlib.import_module("estimater")
         self._FPEst = _est_mod.FoundationPose
 
-        self._glctx = None          # lazy init on first register() call
-        self._est_list: List = []   # one internal estimator per tracked detection
+        self._glctx = None
+        # Each entry: {"est": <FPEstimator>, "model_idx": int, "model_id": str}
+        self._est_list: List[Dict] = []
 
     # ------------------------------------------------------------------
     # Checks and downloads
@@ -170,16 +214,17 @@ class FoundationPoseRefiner:
                 self._scorer.model.half()
         logging.info("FoundationPose models loaded.")
 
-    def _make_estimator(self):
-        """Create a fresh internal FoundationPose estimator, lazily init glctx."""
+    def _make_estimator(self, model_idx: int = 0):
+        """Create a fresh internal FoundationPose estimator for the given model."""
         self._load_models()
         if self._glctx is None:
             import nvdiffrast.torch as dr
             self._glctx = dr.RasterizeCudaContext()
+        mesh = self._meshes[model_idx]
         return self._FPEst(
-            model_pts=self._mesh.vertices,
-            model_normals=self._mesh.vertex_normals,
-            mesh=self._mesh,
+            model_pts=mesh.vertices,
+            model_normals=mesh.vertex_normals,
+            mesh=mesh,
             scorer=self._scorer,
             refiner=self._refiner,
             glctx=self._glctx,
@@ -209,39 +254,69 @@ class FoundationPoseRefiner:
 
         Resets internal tracking state; call track() on subsequent frames.
 
+        Consumes "model_indices" and "model_ids" from sam6d_results when present
+        (produced by MultiModelSAM6D). Falls back to model index 0 for single-model
+        SAM6D output.
+
         Args:
             rgb: (H, W, 3) uint8 BGR or RGB image (same convention as SAM-6D input).
             depth: (H, W) raw depth pixels. Multiply by depth_scale to get mm.
             K: (3, 3) camera intrinsic matrix.
-            sam6d_results: Output dict from SAM6D.forward().
+            sam6d_results: Output dict from SAM6D.forward() or MultiModelSAM6D.forward().
             depth_scale: Scale to convert raw depth to mm (e.g. 1000.0 for uint16 mm depth).
 
         Returns:
             List of dicts, one per processed detection:
-                pose        — (4, 4) float32 object-in-camera transform, translation in metres.
-                fp_score    — FoundationPose scorer confidence (higher is better).
-                sam6d_score — SAM-6D pose_score for this detection.
-                mask        — (H, W) bool mask used for registration.
-                box         — (4,) int64 xyxy bounding box.
+                pose          — (4, 4) float32 object-in-camera transform, translation in metres.
+                fp_score      — FoundationPose scorer confidence (higher is better).
+                sam6d_score   — SAM-6D pose_score for this detection.
+                mask          — (H, W) bool mask used for registration.
+                box           — (4,) int64 xyxy bounding box.
                 detection_idx — index into the sam6d_results arrays.
+                model_idx     — index into self._meshes / self._cad_paths.
+                model_id      — string identifier for this model.
         """
         if len(sam6d_results.get("poses", [])) == 0:
             self._est_list = []
             return []
 
         depth_m = self._depth_to_metres(depth, depth_scale)
-
         pose_scores = sam6d_results["pose_scores"]
-        order = np.argsort(pose_scores)[::-1]  # descending by score
-        selected = [i for i in order if pose_scores[i] >= self.min_pose_score]
+        n_det = len(pose_scores)
+        M = len(self._meshes)
+
+        # Consume model assignments (defaults to model 0 for single-model SAM6D output)
+        model_indices = sam6d_results.get(
+            "model_indices", np.zeros(n_det, dtype=np.int64)
+        )
+        model_ids_out = sam6d_results.get(
+            "model_ids", [self._model_ids[0]] * n_det
+        )
+
+        # Sort descending by pose_score; apply per-model min_pose_score and
+        # max_detections_per_model, then global max_detections cap.
+        order = np.argsort(pose_scores)[::-1]
+        per_model_count = [0] * M
+        selected = []
+        for i in order:
+            midx = int(model_indices[i])
+            if pose_scores[i] < self._min_pose_score[midx]:
+                continue
+            cap = self._max_det_per_model[midx]
+            if cap is not None and per_model_count[midx] >= cap:
+                continue
+            selected.append(i)
+            per_model_count[midx] += 1
+
         if self.max_detections is not None:
             selected = selected[: self.max_detections]
 
         self._est_list = []
         results = []
         for i in selected:
+            model_idx = int(model_indices[i])
             mask = sam6d_results["masks"][i].astype(np.uint8)
-            est = self._make_estimator()
+            est = self._make_estimator(model_idx)
             pose = est.register(
                 K=K,
                 rgb=rgb,
@@ -250,7 +325,8 @@ class FoundationPoseRefiner:
                 iteration=self.est_refine_iter,
             )
             fp_score = float(est.scores[0].item())
-            self._est_list.append(est)
+            mid = model_ids_out[i]
+            self._est_list.append({"est": est, "model_idx": model_idx, "model_id": mid})
             results.append(
                 {
                     "pose": pose.astype(np.float32),
@@ -259,6 +335,8 @@ class FoundationPoseRefiner:
                     "mask": mask.astype(bool),
                     "box": sam6d_results["boxes"][i],
                     "detection_idx": int(i),
+                    "model_idx": model_idx,
+                    "model_id": mid,
                 }
             )
 
@@ -284,7 +362,9 @@ class FoundationPoseRefiner:
 
         Returns:
             List of dicts (one per active estimator):
-                pose     — (4, 4) float32 object-in-camera transform in metres.
+                pose      — (4, 4) float32 object-in-camera transform in metres.
+                model_idx — index into self._meshes / self._cad_paths.
+                model_id  — string identifier for this model.
         """
         if not self._est_list:
             raise RuntimeError(
@@ -293,14 +373,20 @@ class FoundationPoseRefiner:
 
         depth_m = self._depth_to_metres(depth, depth_scale)
         results = []
-        for est in self._est_list:
-            pose = est.track_one(
+        for entry in self._est_list:
+            pose = entry["est"].track_one(
                 rgb=rgb,
                 depth=depth_m,
                 K=K,
                 iteration=self.track_refine_iter,
             )
-            results.append({"pose": pose.astype(np.float32)})
+            results.append(
+                {
+                    "pose": pose.astype(np.float32),
+                    "model_idx": entry["model_idx"],
+                    "model_id": entry["model_id"],
+                }
+            )
 
         return results
 
