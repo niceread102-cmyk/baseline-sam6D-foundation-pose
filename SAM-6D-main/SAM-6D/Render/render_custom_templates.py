@@ -30,6 +30,34 @@ cnos_cam_fpath = os.path.join(render_dir, '../Instance_Segmentation_Model/utils/
 
 bproc.init()
 
+# Select render device.  Blender 4.0.x CUDA kernels only support SM ≤ 8.9 (Ampere).
+# Detect the GPU's compute capability via nvidia-smi and fall back to CPU if the
+# GPU is newer (e.g. Blackwell GB10 = SM 12.1) to avoid a CUDA compilation error
+# that would abort rendering mid-loop.
+def _blender_supports_gpu():
+    try:
+        import subprocess, re
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return True  # no nvidia-smi — let Blender decide
+        for line in result.stdout.strip().splitlines():
+            major, minor = line.strip().split(".")
+            # config.h: __CUDA_ARCH__ <= 899 is the last supported range
+            if int(major) * 100 + int(minor) > 899:
+                return False
+        return True
+    except Exception:
+        return True  # can't determine — let Blender decide
+
+if _blender_supports_gpu():
+    bproc.renderer.set_render_devices()
+else:
+    print("[SAM-6D] GPU SM >{} is unsupported by this Blender's CUDA; using CPU.".format("8.9"))
+    bproc.renderer.set_render_devices(use_only_cpu=True)
+
 def get_norm_info(mesh_path):
     mesh = trimesh.load(mesh_path, force='mesh')
 

@@ -46,6 +46,8 @@ gorilla-core==0.2.7.8
 
 # --- Template rendering ---
 blenderproc>=2.6.1
+gitpython       # blenderproc normally self-installs this; list explicitly for ARM64
+pypng           # blenderproc normally self-installs this; list explicitly for ARM64
 
 # --- FoundationPose runtime ---
 warp-lang

@@ -60,7 +60,38 @@ CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST="12.1" \
   pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git
 ```
 
-### 4. Install remaining dependencies
+### 4. Install pytorch3d (FoundationPose dependency)
+
+`pytorch3d` has no PyPI wheels — it must be built from source regardless of platform.
+
+```bash
+git clone --depth 1 https://github.com/facebookresearch/pytorch3d.git /tmp/pytorch3d
+cd /tmp/pytorch3d
+CUDA_HOME=/usr/local/cuda \
+  TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9" \
+  MAX_JOBS=8 \
+  pip install -e . --no-build-isolation
+cd -
+```
+
+This compiles ~200 CUDA/C++ files and takes **20–40 minutes**. `MAX_JOBS` limits parallel compilation to avoid OOM; lower it if the build stalls.
+
+> **TORCH_CUDA_ARCH_LIST**: match to your GPU. Common values — RTX 30xx: `"8.6"`, A100: `"8.0"`, RTX 40xx: `"8.9"`. Check `torch.cuda.get_arch_list()` if unsure.
+
+**NVIDIA Spark / ARM (SM 12.x):** Include all architectures your PyTorch was built with:
+```bash
+CUDA_HOME=/usr/local/cuda-13.0 \
+  TORCH_CUDA_ARCH_LIST="8.0;9.0;10.0;11.0;12.0" \
+  MAX_JOBS=8 \
+  pip install -e /tmp/pytorch3d --no-build-isolation
+```
+
+**Verify:**
+```bash
+python -c "import pytorch3d; from pytorch3d.transforms import so3_log_map; print('pytorch3d', pytorch3d.__version__, 'OK')"
+```
+
+### 5. Install remaining dependencies
 
 ```bash
 pip install -r requirements.txt
@@ -71,7 +102,33 @@ pip install -r requirements.txt
 grep -v '^open3d' requirements.txt | pip install -r /dev/stdin
 ```
 
-### 5. Build the FoundationPose C++ extension
+### 6. Build the pointnet2 CUDA extension
+
+SAM-6D's Pose Estimation Model uses a CUDA extension (`pointnet2._ext`) that must be compiled before first use:
+
+```bash
+pip install SAM-6D-main/SAM-6D/Pose_Estimation_Model/model/pointnet2 --no-build-isolation
+```
+
+This compiles the `.cu` / `.cpp` sources and installs the `pointnet2` package into your environment. `nvcc` must be on `PATH` (it comes with the CUDA Toolkit). The build takes ~1–2 minutes.
+
+**NVIDIA Spark / ARM:** Set the target architecture before installing:
+```bash
+TORCH_CUDA_ARCH_LIST="12.1" \
+  pip install SAM-6D-main/SAM-6D/Pose_Estimation_Model/model/pointnet2 --no-build-isolation
+```
+
+**Verify the build:**
+```bash
+python -c "import torch; import pointnet2._ext; print('pointnet2 OK')"
+```
+Note: `torch` must be imported first — it loads `libc10.so` into memory, which the extension links against.
+
+If Python version changes or you switch environments, reinstall to recompile for the new interpreter.
+
+---
+
+### 7. Build the FoundationPose C++ extension
 
 FoundationPose uses a small C++ library (`mycpp`) for pose hypothesis clustering. Build it once:
 
@@ -114,9 +171,16 @@ make -j$(nproc)
 cd ../../..
 ```
 
-### 6. Verify the build
+### 8. Verify the builds
 
 ```bash
+# pytorch3d
+python -c "import pytorch3d; from pytorch3d.transforms import so3_log_map; print('pytorch3d', pytorch3d.__version__, 'OK')"
+
+# pointnet2 CUDA extension
+python -c "import torch; import pointnet2._ext; print('pointnet2 OK')"
+
+# FoundationPose mycpp extension
 python -c "
 import sys
 sys.path.insert(0, 'FoundationPose-main')
@@ -230,17 +294,58 @@ If nvdiffrast's build fails with a CUDA version mismatch error, make sure your P
 | 12.8 | `https://download.pytorch.org/whl/cu128` |
 | 13.0 (Spark) | `https://download.pytorch.org/whl/cu130` |
 
+### Blender (ARM64)
+
+BlenderProc 2.x hardcodes its auto-download to `blender-*-linux-x64`. The Blender Foundation provides no official Linux ARM64 binary (only macOS/Windows ARM64). Running the x86_64 binary on aarch64 fails immediately with `Exec format error`.
+
+**Fix:** Install Blender from Ubuntu's apt repository (4.0.2 ARM64) and set up a wrapper directory that BlenderProc's path-detection logic understands:
+
+```bash
+# 1. Install Blender ARM64
+sudo apt install blender
+
+# 2. Create a BlenderProc-compatible wrapper directory (already done in this repo)
+#    ~/blender/blender-arm64/ contains a symlink to /usr/bin/blender and a 4.0/ subdir
+#    (this satisfies BlenderProc's version-detection heuristic)
+```
+
+Pass the wrapper directory to `SAM6D`:
+
+```python
+model = SAM6D(
+    cad_path=CAD_PATH,
+    blender_path="/home/<user>/blender/blender-arm64",
+    ...
+)
+```
+
+Or set the `BLENDER_PATH` environment variable before launching the notebook:
+
+```bash
+export BLENDER_PATH=$HOME/blender/blender-arm64
+```
+
+**Note:** The Blender Foundation requires `--custom-blender-path` to point to a directory that contains both a `blender` binary and a version subdirectory (e.g. `4.0/`) — a plain `/usr/bin` path does not satisfy this requirement. The wrapper directory at `~/blender/blender-arm64/` provides exactly this structure.
+
 ---
 
 ## Troubleshooting
 
-**`mycpp C++ extension not found`**  
-Run the cmake/make build step (Section 5 above). If Python version changes, rebuild.
+**`ImportError: Could not import _ext module` / `No module named 'pointnet2._ext'`**  
+The pointnet2 CUDA extension has not been compiled. Run the build step (Section 6 above). If the build says "could not create `pointnet2/_ext...so`: No such file or directory", the compilation itself succeeded but a stale partial build confused setuptools — just re-run the `pip install` command and it will reuse the cached objects.  
+If you get `libc10.so: cannot open shared object file` when testing the import, make sure you import `torch` before `pointnet2._ext` (torch loads `libc10.so` into memory).
 
-**`BlenderProc rendering failed`**  
-Run the render command manually to see Blender's error output:
+**`mycpp C++ extension not found`**  
+Run the cmake/make build step (Section 7 above). If Python version changes, rebuild.
+
+**`BlenderProc rendering failed` / `Exec format error` / `Could not determine major blender version`**  
+On ARM64 (NVIDIA Spark), the x86_64 Blender binary that BlenderProc auto-downloads cannot run. Install ARM64 Blender via apt and point `SAM6D` at the wrapper directory (see [ARM / NVIDIA Spark Notes](#arm--nvidia-spark-notes) above).  
+If you see `Could not determine major blender version`, the `blender_path` you supplied does not have a version subdirectory (like `4.0/`) — use the `~/blender/blender-arm64/` wrapper, not `/usr/bin` directly.
+
+For other rendering failures, run the command manually to see Blender's error output (the full command is printed in the `RuntimeError` message):
 ```bash
 blenderproc run SAM-6D-main/SAM-6D/Render/render_custom_templates.py \
+  --custom-blender-path ~/blender/blender-arm64 \   # omit on x86_64
   --output_dir ./sam6d_templates --cad_path <your-cad-file>
 ```
 

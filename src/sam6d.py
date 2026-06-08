@@ -5,6 +5,8 @@ to cad_path and all shared neural network weights (SAM, DINOv2, PEM) are loaded 
 """
 import os
 import sys
+import shutil
+import subprocess
 import logging
 import numpy as np
 import torch
@@ -107,6 +109,9 @@ class SAM6D:
         half_precision: bool = False,  # fp16 for SAM + DINOv2 only (~1.8 GB saved); PEM stays fp32 (CUDA SVD not supported in fp16)
         auto_offload: bool = False,
         empty_cache_between_stages: bool = False,
+
+        # BlenderProc configuration
+        blender_path: Optional[str] = None,  # path to Blender install dir (contains the `blender` binary); required on ARM64 Linux where BlenderProc can't auto-download an ARM binary. Falls back to BLENDER_PATH env var.
     ):
         _ensure_sam6d_paths()
 
@@ -185,6 +190,7 @@ class SAM6D:
         self._half_precision          = half_precision
         self._auto_offload            = auto_offload
         self._empty_cache             = empty_cache_between_stages
+        self._blender_path            = blender_path or os.environ.get("BLENDER_PATH")
 
         _ism_ckpt = _ISM_ROOT / "checkpoints"
         _pem_ckpt = _PEM_ROOT / "checkpoints"
@@ -445,30 +451,88 @@ class SAM6D:
             logging.info(f"Templates already at {tmpl_dir}, skipping render.")
             return
 
-        render_script = str(_SAM6D_ROOT / "Render" / "render_custom_templates.py")
-        extra = ""
+        render_script = _SAM6D_ROOT / "Render" / "render_custom_templates.py"
+        render_args = [shutil.which("blenderproc") or "blenderproc", "run", str(render_script)]
+        if self._blender_path:
+            render_args += ["--custom-blender-path", str(self._blender_path)]
+        render_args += ["--output_dir", str(template_dir), "--cad_path", str(cad_path)]
         if mesh_color is not None:
-            r, g, b = mesh_color
-            extra += f" --mesh_color {r} {g} {b}"
+            render_args += ["--mesh_color", str(mesh_color[0]), str(mesh_color[1]), str(mesh_color[2])]
         if flat_shading:
-            extra += " --flat_shading"
+            render_args += ["--flat_shading"]
         if roughness is not None:
-            extra += f" --roughness {roughness}"
+            render_args += ["--roughness", str(roughness)]
         if metallic is not None:
-            extra += f" --metallic {metallic}"
+            render_args += ["--metallic", str(metallic)]
         if light_energy != 1000:
-            extra += f" --light_energy {light_energy}"
-        cmd = (
-            f"env -u MPLBACKEND blenderproc run {render_script} "
-            f"--output_dir {template_dir} --cad_path {cad_path}{extra}"
-        )
-        logging.info(f"Rendering templates: {cmd}")
-        ret = os.system(cmd)
+            render_args += ["--light_energy", str(light_energy)]
+
+        # Blender's --python-use-system-env inherits OS env vars but not the
+        # virtualenv sys.path; propagate it via PYTHONPATH so blenderproc's
+        # dependencies (requests, h5py, …) are importable inside Blender.
+        _venv_sp = ":".join(p for p in sys.path if "site-packages" in p)
+        _env = {**os.environ, "PYTHONPATH": ":".join(filter(None, [_venv_sp, os.environ.get("PYTHONPATH", "")])),
+                "_SAM6D_SITE_PKGS": _venv_sp}
+        _env.pop("MPLBACKEND", None)
+
+        # When Blender uses the OS Python (no bundled python3.11), blenderproc's
+        # determine_python_paths() derives blender_path='/' from sys.executable
+        # (/usr/bin/python3.X) and then fails to find /python/bin/python3.11.
+        # Fix: create a python3.11 shim inside the blender dir and pre-populate
+        # the blenderproc pip cache so it never tries to call that binary.
+        _bproc_python_shim = ""
+        if self._blender_path:
+            import json as _json
+            _bp = Path(self._blender_path)
+            _major = next(
+                (d for d in sorted(os.listdir(_bp)) if (_bp / d).is_dir() and d.replace(".", "").isdigit()),
+                None,
+            )
+            if _major:
+                _shim_path = _bp / _major / "python" / "bin" / "python3.11"
+                if not _shim_path.exists():
+                    _shim_path.parent.mkdir(parents=True, exist_ok=True)
+                    _shim_path.symlink_to(Path(sys.executable).resolve())
+                _bproc_python_shim = str(_shim_path)
+
+                _cache_dir = _bp / "custom-python-packages"
+                _cache_file = _cache_dir / "installed_packages_cache_v2.json"
+                if not _cache_file.exists():
+                    _cache_dir.mkdir(exist_ok=True)
+                    try:
+                        import importlib.util as _ilu
+                        _dc_path = next(
+                            (Path(p) / "blenderproc/python/utility/DefaultConfig.py"
+                             for p in sys.path
+                             if (Path(p) / "blenderproc/python/utility/DefaultConfig.py").exists()),
+                            None,
+                        )
+                        if _dc_path:
+                            _dc_spec = _ilu.spec_from_file_location("_bproc_DefaultConfig", _dc_path)
+                            _dc_mod = _ilu.module_from_spec(_dc_spec)
+                            _dc_spec.loader.exec_module(_dc_mod)
+                            _default_pkgs = _dc_mod.DefaultConfig.default_pip_packages
+                        else:
+                            _default_pkgs = []
+                    except Exception:
+                        _default_pkgs = []
+                    _cache: Dict[str, Any] = {}
+                    for _pkg in _default_pkgs:
+                        if "==" in _pkg:
+                            _n, _v = _pkg.lower().split("==", 1)
+                            _cache[_n.strip()] = _v.split(" -f ")[0].strip()
+                        else:
+                            _cache[_pkg.lower().strip()] = None
+                    _cache_file.write_text(_json.dumps(_cache))
+
+        _env["_BPROC_PYTHON_SHIM"] = _bproc_python_shim
+
+        cmd_str = " ".join(render_args)
+        logging.info(f"Rendering templates: {cmd_str}")
+        ret = subprocess.run(render_args, env=_env).returncode
         if ret != 0 or len(list(tmpl_dir.glob("rgb_*.png"))) == 0:
             raise RuntimeError(
-                f"BlenderProc rendering failed (exit {ret}). "
-                f"Run manually: blenderproc run {render_script} "
-                f"--output_dir {template_dir} --cad_path {cad_path}{extra}"
+                f"BlenderProc rendering failed (exit {ret}). Run manually:\n{cmd_str}"
             )
 
     # ------------------------------------------------------------------
