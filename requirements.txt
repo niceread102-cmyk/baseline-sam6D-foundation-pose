@@ -63,3 +63,8 @@ gdown
 # --- Notebook ---
 jupyter
 ipykernel
+
+# --- Photoneo PhoXi scanner (optional) ---
+# Required only for sam6d_example_photoneo.ipynb.
+# Also requires PhoXi Control desktop application to be running.
+phoxi_api

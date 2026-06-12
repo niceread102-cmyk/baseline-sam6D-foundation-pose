@@ -88,6 +88,8 @@ print('mycpp OK:', so[0].name if so else 'NOT FOUND')
 
 ## Running the Notebook
 
+### Generic RGB-D input
+
 ```bash
 jupyter notebook sam6d_example.ipynb
 ```
@@ -100,6 +102,32 @@ In the **Configuration** cell, update these two variables:
 | `DEPTH_SCALE` | Multiply raw depth pixels → mm. Use `1.0` if depth is already in mm, `1000.0` for uint16 RealSense depth |
 
 Everything else (model weight downloads, template rendering, descriptor caching) happens automatically on first run.
+
+### Photoneo PhoXi 3D scanner
+
+A dedicated notebook is provided for Photoneo PhoXi scanners:
+
+```bash
+jupyter notebook sam6d_example_photoneo.ipynb
+```
+
+This notebook reads directly from a `.praw` file via a virtual file camera, or falls back to exported TIF/PNG files if PhoXi Control is not available.
+
+**Additional requirement — `phoxi_api`:**
+
+`phoxi_api` is already listed in `requirements.txt` and installed with the rest of the dependencies:
+
+```bash
+pip install phoxi_api
+```
+
+**PhoXi Control must be running** when using the live path. Start it before launching the notebook:
+
+```bash
+/usr/bin/PhoXiControl &
+```
+
+If PhoXi Control is not running (or `phoxi_api` is unavailable), the notebook falls back to loading depth and texture directly from exported TIF/PNG files — set the `PREFIX` variable and fill in `FX`, `FY`, `CX`, `CY` from the calibration panel in PhoXi Control (Camera → Calibration → Camera Matrix).
 
 ---
 
@@ -141,14 +169,15 @@ This takes ~1–2 minutes and requires BlenderProc (installed via `requirements.
 ## Repository Structure
 
 ```
-sam6d_example.ipynb       # End-to-end usage notebook
-requirements.txt          # Python dependencies
+sam6d_example.ipynb              # End-to-end usage notebook (generic RGB-D)
+sam6d_example_photoneo.ipynb     # Photoneo PhoXi scanner notebook
+requirements.txt                 # Python dependencies
 src/
-  sam6d.py                # SAM6D class — ISM + PEM wrapper
-  foundationpose.py       # FoundationPoseRefiner class
-SAM-6D-main/              # SAM-6D source (do not modify)
-FoundationPose-main/      # FoundationPose source (do not modify)
-checkpoints/              # MAE ViT-Base backbone checkpoint (auto-downloaded)
+  sam6d.py                       # SAM6D class — ISM + PEM wrapper
+  foundationpose.py              # FoundationPoseRefiner class
+SAM-6D-main/                     # SAM-6D source (do not modify)
+FoundationPose-main/             # FoundationPose source (do not modify)
+checkpoints/                     # MAE ViT-Base backbone checkpoint (auto-downloaded)
 ```
 
 ---
@@ -170,6 +199,12 @@ Download weights manually using the links in the Model Weights section above.
 
 **CUDA out of memory**  
 Reduce `points_per_side` (fewer SAM proposals) or `n_template_view` in the `SAM6D(...)` constructor.
+
+**`ModuleNotFoundError: No module named 'phoxi_api'`**  
+Install it with `pip install phoxi_api`. This is only needed for `sam6d_example_photoneo.ipynb`; the main notebook has no dependency on it.
+
+**`RuntimeError: PhoXi Control is not running`**  
+Start PhoXi Control (`/usr/bin/PhoXiControl`) before running the Photoneo notebook. Alternatively, export your scan as TIF/PNG files and use the fallback path in the notebook.
 
 **Depth looks wrong / no detections**  
 Check `DEPTH_SCALE`. For a RealSense camera streaming uint16 depth in mm, use `DEPTH_SCALE=1000.0` (converts the `0.0–0.2` raw range to `0–200` mm). For depth already in mm, use `1.0`.
