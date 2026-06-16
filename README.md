@@ -358,7 +358,58 @@ Reduce `points_per_side` (fewer SAM proposals) or `n_template_view` in the `SAM6
 **Depth looks wrong / no detections**  
 Check `DEPTH_SCALE`. For a RealSense camera streaming uint16 depth in mm, use `DEPTH_SCALE=1000.0` (converts the `0.0–0.2` raw range to `0–200` mm). For depth already in mm, use `1.0`.
 
+# Pytorch3D ARM64 Install
+On Linux ARM64 (aarch64 architectures like AWS Graviton, Ampere servers, or NVIDIA Jetson platforms), pre-compiled PyTorch3D wheels do not exist. You must build PyTorch3D from source.
+Follow this sequence to set up the system tools, match environment variables, and compile PyTorch3D natively.
+## 1. Install System Compilers [5] 
+The build process needs local C++ and CUDA compilation tools. Run the following command in your terminal: 
+
+sudo apt update && sudo apt install -y build-essential gcc g++ git
+
+## 2. Set Critical Environment Variables [6] 
+Without telling the compiler where your ARM64 CUDA environment is or how to compile, the build will crash. Execute these in your shell before building: [5] 
+
+# Force the system to use CUDA architecture during compilation
+export FORCE_CUDA=1
+# (Optional) Map CUDA paths if you are using an NVIDIA Jetson device
+export CUDA_HOME=/usr/local/cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+## 3. Install Pre-requisite Packages
+Before compiling the core repository, install fvcore, iopath, and nvidiacub (required for CUDA operations on older systems):
+
+pip install fvcore iopath target-nvidiacub
+
+## 4. Clone and Build from Source [3] 
+To prevent a known configuration bug in pip install . on ARM64 architectures, use the dedicated Python setup installer rather than standard pip flags:
+
+# Clone the official repo
+git clone https://github.com/facebookresearch/pytorch3d.git
+cd pytorch3d
+# Build and link the binaries locally (This takes 15-40 minutes on ARM64)
+python setup.py install
+
+## Verification
+Once complete, open a Python shell from a directory other than the cloned pytorch3d folder to check the native build:
+
+import torchimport pytorch3d
+print("CUDA Available:", torch.cuda.is_available())
+print("PyTorch3D Version:", pytorch3d.__version__)
 ---
+
+# RealSense Not Connected Fix
+```
+# Download the official udev rules from librealsense
+sudo wget -O /etc/udev/rules.d/99-realsense-libusb.rules \
+  https://raw.githubusercontent.com/IntelRealSense/librealsense/master/config/99-realsense-libusb.rules
+
+# Reload udev and re-trigger for the device
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# Unplug and replug the camera, then retry
+```
 
 ## Credits
 

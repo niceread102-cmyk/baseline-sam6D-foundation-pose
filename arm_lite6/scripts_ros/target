@@ -1,0 +1,3 @@
+#!/usr/bin/env python3
+from my_lite6_control.target import main
+main()

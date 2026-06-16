@@ -95,6 +95,7 @@ class SAM6D:
         n_template_view: int = 42,
         min_component_area_ratio: float = 0.005,  # drop mask blobs < ratio * largest blob (0=off)
         mask_overlap_thresh: float = 0.9,          # drop lower-scoring mask if overlap > thresh (0=off)
+        geo_iou_thresh: Union[float, List[float]] = 0.0,  # drop proposals with geometric IoU below this (0=off)
         pose_score_thresh: Union[float, List[float]] = 0.0,
         max_detections_per_model: Optional[Union[int, List[Optional[int]]]] = None,
 
@@ -171,11 +172,13 @@ class SAM6D:
         # --- Broadcast per-model thresholds ---
         self._det_score_thresh_list  = _broadcast_thresh(det_score_thresh, M)
         self._confidence_thresh_list = _broadcast_thresh(confidence_thresh, M)
+        self._geo_iou_thresh_list    = _broadcast_thresh(geo_iou_thresh, M)
         self._pose_score_thresh_list = _broadcast_thresh(pose_score_thresh, M)
         self._max_det_per_model      = _bcast(max_detections_per_model, M, None)
         # Scalar backward-compat aliases (index-0 values)
         self.det_score_thresh  = self._det_score_thresh_list[0]
         self.confidence_thresh = self._confidence_thresh_list[0]
+        self.geo_iou_thresh    = self._geo_iou_thresh_list[0]
         self.pose_score_thresh = self._pose_score_thresh_list[0]
 
         self.visible_thred            = visible_thred
@@ -937,6 +940,12 @@ class SAM6D:
         # Per-model det_score_thresh (degrades to scalar comparison when M=1)
         det_thresh_arr = np.array([self._det_score_thresh_list[m] for m in pred_obj_np])
         keep = all_ism_np > det_thresh_arr
+
+        # Per-model geo_iou_thresh
+        geo_thresh_arr = np.array([self._geo_iou_thresh_list[m] for m in pred_obj_np])
+        if geo_thresh_arr.any():
+            keep &= all_geo_np >= geo_thresh_arr
+
         if not keep.any():
             return self._empty_result(H, W)
         keep_idx = np.where(keep)[0]

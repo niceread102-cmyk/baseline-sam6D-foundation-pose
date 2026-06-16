@@ -21,6 +21,57 @@ def _ensure_fp_paths():
             sys.path.insert(0, p)
 
 
+# ---------------------------------------------------------------------------
+# Safe Python fallback for mycpp.cluster_poses
+#
+# mycpp.cluster_poses() segfaults on aarch64 (Eigen NEON alignment fault when
+# pybind11 converts the numpy (N,4,4) array to vectorMatrix4f).  We replace it
+# with an equivalent pure-Python implementation and monkey-patch the module so
+# estimater.py transparently calls the Python version without any upstream edits.
+# ---------------------------------------------------------------------------
+
+_mycpp_patched = False
+
+
+def _cluster_poses_python(angle_diff, dist_diff, poses_in, symmetry_tfs):
+    """Pure-Python equivalent of mycpp.cluster_poses."""
+    poses_in = np.asarray(poses_in, dtype=np.float32)
+    symmetry_tfs = np.asarray(symmetry_tfs, dtype=np.float32)
+    radian_thres = float(angle_diff) / 180.0 * np.pi
+    print(f"num original candidates = {len(poses_in)}")
+    out = [poses_in[0]]
+    for i in range(1, len(poses_in)):
+        cur = poses_in[i]
+        is_new = True
+        for cluster in out:
+            if np.linalg.norm(cluster[:3, 3] - cur[:3, 3]) >= dist_diff:
+                continue
+            for tf in symmetry_tfs:
+                R_cur = (cur @ tf)[:3, :3]
+                R_clu = cluster[:3, :3]
+                cos_a = np.clip((np.trace(R_cur @ R_clu.T) - 1.0) / 2.0, -1.0, 1.0)
+                if np.arccos(cos_a) < radian_thres:
+                    is_new = False
+                    break
+            if not is_new:
+                break
+        if is_new:
+            out.append(cur)
+    print(f"num of pose after clustering: {len(out)}")
+    return out
+
+
+def _patch_mycpp_cluster_poses():
+    """Replace mycpp.cluster_poses with the Python fallback (idempotent)."""
+    global _mycpp_patched
+    if _mycpp_patched:
+        return
+    mycpp_mod = sys.modules.get("mycpp")
+    if mycpp_mod is not None:
+        mycpp_mod.cluster_poses = _cluster_poses_python
+        _mycpp_patched = True
+
+
 def _broadcast_thresh(val, M, default=None):
     if val is None:
         return [default] * M
@@ -50,6 +101,7 @@ class FoundationPoseRefiner:
         device: str = "cuda",
         weights_dir: Optional[Union[str, Path]] = None,
         mesh_scale: float = 1.0 / 1000.0,
+        physical_scale: float = 1.0,
         est_refine_iter: int = 5,
         track_refine_iter: int = 2,
         max_detections: Optional[int] = None,
@@ -74,6 +126,12 @@ class FoundationPoseRefiner:
             mesh_scale: Multiplier applied to mesh vertices to convert them to
                 metres for FoundationPose (default 1/1000 = mm → m). Set to 1.0
                 if your mesh is already in metres.
+            physical_scale: Additional scale factor applied on top of mesh_scale to
+                compensate for a size mismatch between the CAD model and the physical
+                object (default 1.0 = no adjustment). The effective vertex scale is
+                mesh_scale * physical_scale. This affects pose estimation quality:
+                mesh_diameter, crop windows, and translation step sizes inside the
+                FoundationPose neural network all depend on the physical model size.
             est_refine_iter: Refinement iterations for register() (default 5).
             track_refine_iter: Refinement iterations for track_one() (default 2).
             max_detections: Global cap on detections to process per refine_from_sam6d()
@@ -124,22 +182,26 @@ class FoundationPoseRefiner:
         self._maybe_download_weights(_weights_dir)
 
         import trimesh
+        effective_scale = mesh_scale * physical_scale
         self._meshes: List = []
         for cp in cad_paths:
-            logging.info(f"Loading mesh from {cp} (mesh_scale={mesh_scale}) ...")
+            logging.info(f"Loading mesh from {cp} (mesh_scale={mesh_scale}, physical_scale={physical_scale}) ...")
             mesh = trimesh.load(str(cp), force="mesh")
-            mesh.vertices = mesh.vertices * mesh_scale
+            mesh.vertices = mesh.vertices * effective_scale
             mesh.process(validate=True)
             if len(mesh.vertex_normals) == 0:
                 mesh = mesh.smoothed()
             self._meshes.append(mesh)
             logging.info(
                 f"Mesh loaded: {len(mesh.vertices)} vertices, "
-                f"diameter≈{mesh.bounding_box.extents.max():.4f} m."
+                f"diameter≈{mesh.bounding_box.extents.max():.4f} m  "
+                f"(mesh_scale={mesh_scale}, physical_scale={physical_scale})."
             )
         # backward compat alias
         self._mesh = self._meshes[0]
         self._mesh_scale = mesh_scale
+        self._physical_scale = physical_scale
+        self._effective_scale = effective_scale
 
         self._half_precision = half_precision
         self._lazy_load = lazy_load
@@ -155,6 +217,11 @@ class FoundationPoseRefiner:
         self._glctx = None
         # Each entry: {"est": <FPEstimator>, "model_idx": int, "model_id": str}
         self._est_list: List[Dict] = []
+
+    @property
+    def effective_scale(self) -> float:
+        """mesh_scale * physical_scale — the actual multiplier applied to mesh vertices."""
+        return self._effective_scale
 
     # ------------------------------------------------------------------
     # Checks and downloads
@@ -217,6 +284,7 @@ class FoundationPoseRefiner:
     def _make_estimator(self, model_idx: int = 0):
         """Create a fresh internal FoundationPose estimator for the given model."""
         self._load_models()
+        _patch_mycpp_cluster_poses()
         if self._glctx is None:
             import nvdiffrast.torch as dr
             self._glctx = dr.RasterizeCudaContext()
