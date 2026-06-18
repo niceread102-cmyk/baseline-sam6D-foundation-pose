@@ -1,0 +1,6 @@
+_target_: src.binpick.arm_controller.XArmController
+robot_ip: "192.168.1.150"
+move_speed: 0.3   # rad/s
+move_acc: 5.0     # rad/s²
+max_joint_delta: 1.5   # rad; safety limit per joint per command (0 = disabled)
+# ik_solver is injected at instantiation time from cfg.ik

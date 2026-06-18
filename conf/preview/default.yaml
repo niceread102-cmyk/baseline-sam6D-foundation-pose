@@ -1,0 +1,12 @@
+# Live preview window (src/binpick/visualizer.py — LivePreview)
+# ik_solver and T_cam_base injected by BinPicker.
+_target_: src.binpick.visualizer.LivePreview
+
+# Size of each panel in the 2×2 composite (total window is 2×panel_w by 2×panel_h)
+panel_w: 640
+panel_h: 480
+
+# Display frame rate (independent of capture / inference rate)
+fps: 15
+
+window_name: "BinPicker Preview"

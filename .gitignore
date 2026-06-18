@@ -1,3 +1,7 @@
+captures/
+logs/
+scripts/aruco_markers
+
 *.claude
 *.pth
 *.ckpt

@@ -7,11 +7,11 @@ from launch.actions import (
     ExecuteProcess,
 )
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, FindExecutable
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from ament_index_python.packages import get_package_share_directory
 
 SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), '..', 'scripts')
+_LAUNCH_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Delay (seconds) before running robot init — give moveit_servo time to come up.
 INIT_DELAY = 5.0
@@ -26,15 +26,23 @@ def generate_launch_description():
 
     robot_ip = LaunchConfiguration('robot_ip')
 
-    xarm_servo_share = get_package_share_directory('xarm_moveit_servo')
+    # Use our local patched launch file instead of the xarm_moveit_servo chain.
+    # The upstream chain (lite6_moveit_servo_realmove → _robot_moveit_servo_realmove)
+    # loses the ros2_control_plugin argument due to Jazzy's scoped argument handling,
+    # causing UFRobotFakeSystemHardware to be loaded regardless of what is passed.
     moveit_servo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(xarm_servo_share, 'launch',
-                         'lite6_moveit_servo_realmove.launch.py')
+            os.path.join(_LAUNCH_DIR, '_real_hardware_moveit_servo.launch.py')
         ),
         launch_arguments={
             'robot_ip':    robot_ip,
+            'dof':         '6',
+            'robot_type':  'lite',
+            'hw_ns':       'ufactory',
+            'limited':     'true',
             'add_gripper': 'true',
+            'report_type': 'dev',
+            'ros2_control_plugin': 'uf_robot_hardware/UFRobotSystemHardware',
         }.items(),
     )
 

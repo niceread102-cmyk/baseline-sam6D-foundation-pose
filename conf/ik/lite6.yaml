@@ -1,0 +1,14 @@
+# IK solver for UFactory Lite 6 (src/binpick/ik_solver.py — Lite6IKSolver)
+# Kinematics extracted from arm_lite6/custom_ik.py; no ROS dependency.
+_target_: src.binpick.ik_solver.Lite6IKSolver
+
+# Damped Jacobian pseudoinverse parameters (see custom_ik.py for derivation)
+damping:    0.1    # regularisation term: prevents singularity blow-up
+alpha:      0.5    # step-size scaling
+max_steps:  200    # iteration cap
+threshold:  1.0e-3 # convergence tolerance (metres + radians combined norm)
+step_clip:  0.1    # per-step joint velocity clamp (radians)
+jump_limit: 1.5    # max allowed joint angle change per move (safety, radians)
+
+# Fixed end-effector orientation [roll, pitch, yaw] in radians
+target_rpy: [3.14159265, 0.0, 0.0]   # [π, 0, 0] — gripper pointing straight down

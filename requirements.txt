@@ -53,6 +53,7 @@ pypng           # blenderproc normally self-installs this; list explicitly for A
 warp-lang
 
 # --- Config / serialization ---
+hydra-core>=1.3    # includes omegaconf; used by BinPicker
 omegaconf>=2.3
 PyYAML>=6
 ruamel.yaml>=0.18

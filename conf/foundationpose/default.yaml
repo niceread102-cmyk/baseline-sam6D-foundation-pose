@@ -1,0 +1,21 @@
+# FoundationPose configuration (src/foundationpose.py — FoundationPoseRefiner)
+# cad_path and model_ids are injected by BinPicker from cfg.cad_models.
+_target_: src.foundationpose.FoundationPoseRefiner
+
+# Mesh scaling: effective_scale = mesh_scale * physical_scale (applied to vertices → metres)
+mesh_scale: 0.001      # converts STL/OBJ units (mm) to metres
+physical_scale: 3.0    # set > 1 if the CAD model is smaller than the real object
+
+# Refinement iterations
+est_refine_iter: 5     # pose registration iterations (first frame)
+track_refine_iter: 2   # tracking iterations (subsequent frames, faster)
+
+# Filtering
+min_pose_score: 0.0    # skip SAM6D detections below this score
+# max_detections: null   # uncomment to cap number of refined detections
+
+# Memory
+half_precision: false
+lazy_load: false
+
+debug: 0

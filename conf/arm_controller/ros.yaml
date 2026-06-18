@@ -1,0 +1,9 @@
+# ROS 2 arm controller (src/binpick/arm_controller.py — ROSArmController)
+# Requires lite6_full.launch.py to be running before BinPicker starts.
+_target_: src.binpick.arm_controller.ROSArmController
+
+# Topic on which joint positions are broadcast (used to track current theta)
+joint_state_topic: /joint_states
+
+# Maximum time (seconds) to wait for any single move to complete
+move_timeout: 30.0

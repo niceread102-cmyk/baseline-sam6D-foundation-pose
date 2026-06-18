@@ -184,10 +184,21 @@ class FoundationPoseRefiner:
         import trimesh
         effective_scale = mesh_scale * physical_scale
         self._meshes: List = []
+        self._mesh_centroids: List[np.ndarray] = []
         for cp in cad_paths:
             logging.info(f"Loading mesh from {cp} (mesh_scale={mesh_scale}, physical_scale={physical_scale}) ...")
             mesh = trimesh.load(str(cp), force="mesh")
             mesh.vertices = mesh.vertices * effective_scale
+            # Center the mesh so the origin sits at the geometric centroid.
+            # Without centering the STL origin can be 1+ m from the actual geometry;
+            # FoundationPose must then extrapolate T_obj_cam[:3,3] far outside the
+            # observed depth points, so tiny rotation errors produce huge translation
+            # errors (e.g. 2° error × 1.5 m offset → 52 mm positional error in
+            # pick_xyz that can flip its sign).  After centering, T_obj_cam[:3,3]
+            # equals the centroid directly — no amplification.
+            centroid = np.asarray(mesh.vertices, dtype=float).mean(axis=0)
+            mesh.vertices = np.asarray(mesh.vertices, dtype=float) - centroid
+            self._mesh_centroids.append(centroid.copy())
             mesh.process(validate=True)
             if len(mesh.vertex_normals) == 0:
                 mesh = mesh.smoothed()
@@ -195,7 +206,8 @@ class FoundationPoseRefiner:
             logging.info(
                 f"Mesh loaded: {len(mesh.vertices)} vertices, "
                 f"diameter≈{mesh.bounding_box.extents.max():.4f} m  "
-                f"(mesh_scale={mesh_scale}, physical_scale={physical_scale})."
+                f"(mesh_scale={mesh_scale}, physical_scale={physical_scale}, "
+                f"centroid_offset=[{centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}]m)."
             )
         # backward compat alias
         self._mesh = self._meshes[0]

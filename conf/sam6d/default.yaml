@@ -1,0 +1,33 @@
+# SAM6D configuration (src/sam6d.py — SAM6D class)
+# cad_path and model_ids are injected by BinPicker from cfg.cad_models.
+_target_: src.sam6d.SAM6D
+
+# Segmentation backbone: "vit_h" (2.4 GB, best), "vit_l" / "vit_b" (358 MB, faster)
+sam_model_type: vit_h
+stability_score_thresh: 0.97
+points_per_side: 32
+
+# DINOv2 + PEM matching thresholds
+det_score_thresh: 0.35       # combined ISM score minimum
+confidence_thresh: 0.25      # semantic similarity minimum
+n_template_view: 42          # number of BlenderProc template views to use
+pose_score_thresh: 0.3       # PEM confidence minimum
+min_component_area_ratio: 0.005
+mask_overlap_thresh: 0.9
+geo_iou_thresh: 0.0
+
+# Template rendering
+template_dir: ./sam6d_templates
+reset_templates: false
+# mesh_color: null            # uncomment and set (R,G,B) for colorless meshes
+# flat_shading: true          # recommended for CAD/STL meshes
+# roughness: 0.9
+# light_energy: 1100
+
+# Blender path (required on ARM64; ignored if BLENDER_PATH env var is set)
+# blender_path: /home/joon/blender/blender-arm64
+
+# Memory management
+half_precision: false
+auto_offload: true            # offload SAM6D to CPU before FoundationPose runs
+empty_cache_between_stages: true

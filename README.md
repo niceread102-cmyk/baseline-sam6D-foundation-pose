@@ -411,6 +411,116 @@ sudo udevadm trigger
 # Unplug and replug the camera, then retry
 ```
 
+---
+
+## BinPicker Setup
+
+`BinPicker` (`src/binpick/`) is a modular, Hydra-configured class that ties together SAM6D, FoundationPose, and the Lite 6 arm into a full pick-and-place loop. It runs alongside a live 2×2 OpenCV preview window.
+
+### Additional dependencies
+
+```bash
+# Activate the virtualenv first
+source ~/.virtualenvs/torch_obj_tracking/bin/activate
+
+pip install hydra-core   # includes omegaconf (already in requirements.txt for completeness)
+```
+
+`hydra-core` is now listed in `requirements.txt` so `pip install -r requirements.txt` covers it.
+
+### Arm stack prerequisite
+
+The ROS 2 arm stack must be running before `BinPicker` starts:
+
+```bash
+# Terminal 1 — launch the Lite 6 ROS stack
+ros2 launch my_lite6_control lite6_full.launch.py robot_ip:=192.168.1.150
+```
+
+### Running BinPicker
+
+```bash
+# Terminal 2 — activate venv and start BinPicker
+source ~/.virtualenvs/torch_obj_tracking/bin/activate
+
+python -m src.binpick.binpicker \
+    'cad_models=[{path: /path/to/model.stl, id: mypart}]'
+```
+
+Override any config key on the CLI via Hydra syntax:
+
+```bash
+python -m src.binpick.binpicker \
+    'cad_models=[{path: /path/to/model.stl, id: mypart}]' \
+    arm.hover_position='[0.35, 0.0, 0.25]' \
+    arm.placement_position='[0.35, 0.20, 0.08]' \
+    sam6d.det_score_thresh=0.4 \
+    foundationpose.physical_scale=2.0 \
+    gripper.min_grip_m=0.03 \
+    gripper.max_grip_m=0.06
+```
+
+Multi-model example:
+
+```bash
+python -m src.binpick.binpicker \
+    'cad_models=[{path: /models/part_a.stl, id: part_a}, {path: /models/part_b.obj, id: part_b}]'
+```
+
+### Configuration files
+
+All defaults live in `conf/`:
+
+| File | Controls |
+|------|----------|
+| `conf/config.yaml` | Top-level: arm positions, gripper limits, CAD models |
+| `conf/sam6d/default.yaml` | SAM6D thresholds, template rendering |
+| `conf/foundationpose/default.yaml` | Mesh scale, refinement iterations |
+| `conf/ik/lite6.yaml` | IK solver parameters |
+| `conf/arm_controller/ros.yaml` | ROS topics, move timeout |
+| `conf/grip_planner/simple.yaml` | PCA grip planner |
+| `conf/object_selector/nearest.yaml` | Nearest-object selector |
+| `conf/camera/realsense.yaml` | RealSense exposure, depth scale |
+| `conf/preview/default.yaml` | Preview window size and FPS |
+
+### Hand-eye calibration (IK path overlay)
+
+The live preview can draw arrows showing the planned IK trajectory overlaid on the camera frame. This requires knowing the transform from the robot base to the camera (`T_cam_base`). Without it, the overlay is skipped and a placeholder message is shown.
+
+Once calibrated, set in `conf/config.yaml`:
+
+```yaml
+arm:
+  T_cam_base:
+    - [r00, r01, r02, tx]
+    - [r10, r11, r12, ty]
+    - [r20, r21, r22, tz]
+    - [0.0,  0.0,  0.0, 1.0]
+```
+
+Or pass it on the CLI:
+
+```bash
+python -m src.binpick.binpicker \
+    'arm.T_cam_base=[[r00,r01,r02,tx],[r10,r11,r12,ty],[r20,r21,r22,tz],[0,0,0,1]]'
+```
+
+Without calibration, `NearestObjectSelector` treats FoundationPose camera-frame poses as base-frame poses — sufficient for testing detection but incorrect for physical pick-and-place.
+
+### Swapping modules
+
+Any component can be replaced by writing a new class that inherits the corresponding ABC and setting `_target_` in a new config file:
+
+| To replace | Inherit from | Config dir |
+|------------|--------------|-----------|
+| IK solver | `src.binpick.ik_solver.IKSolver` | `conf/ik/` |
+| Arm controller | `src.binpick.arm_controller.ArmController` | `conf/arm_controller/` |
+| Grip planner | `src.binpick.grip_planner.GripPlanner` | `conf/grip_planner/` |
+| Object selector | `src.binpick.object_selector.ObjectSelector` | `conf/object_selector/` |
+| Camera | *(duck-typed, must expose `.capture()`)* | `conf/camera/` |
+
+---
+
 ## Credits
 
 - [SAM-6D](https://github.com/JiehongLin/SAM-6D) — Lin et al., CVPR 2024

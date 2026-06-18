@@ -873,6 +873,13 @@ class SAM6D:
             model_ids          List[str]        which CAD model each detection belongs to
             model_indices      [N] int64        model index (always 0 for single-model SAM6D)
         """
+        # If the model was offloaded to CPU after the previous call, reload it now
+        # before any GPU operations (predictor.device is still CUDA, so inputs would
+        # land on GPU while model weights are on CPU — causing device mismatch errors
+        # deep inside the SAM attention blocks).
+        if self._auto_offload:
+            self.reload_to_gpu()
+
         if isinstance(rgb, Image.Image):
             rgb_np = np.array(rgb.convert("RGB"))
         else:

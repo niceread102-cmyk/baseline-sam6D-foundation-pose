@@ -1,0 +1,25 @@
+# Intel RealSense D4xx camera (src/binpick/camera.py — RealSenseCamera)
+_target_: src.binpick.camera.RealSenseCamera
+
+width:  640
+height: 480
+fps:    30
+
+# depth_scale: multiply raw uint16 depth pixels to get millimetres.
+# For RealSense streaming in z16 format the raw values are already mm → use 1.0.
+depth_scale: 1.0
+
+# Sensor exposure settings (match to your lighting conditions)
+depth_exposure_us:    6000
+laser_power_frac:     0.5     # fraction of 360 (max laser power)
+depth_gain:           16
+color_exposure_us:    83
+color_white_balance_k: 4600
+
+# Disparity shift (0 = disabled; higher values shift depth range toward near objects)
+disparity_shift: 0
+
+# Depth clamp range (mm) — pixels outside this range are zeroed by sensor firmware.
+# At hover_position=[0.3, 0.0, 0.44] the camera-to-bin-floor distance is ~300-500mm.
+depth_min_mm: 100
+depth_max_mm: 700

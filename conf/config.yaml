@@ -1,0 +1,55 @@
+# BinPicker top-level Hydra config
+#
+# Override any value on the CLI:
+#   python -m src.binpick.binpicker \
+#       'cad_models=[{path: /path/to/obj.stl, id: mypart}]' \
+#       arm.hover_position='[0.35, 0.0, 0.25]' \
+#       sam6d.det_score_thresh=0.4
+
+defaults:
+  - sam6d: default
+  - foundationpose: default
+  - ik: lite6
+  - arm_controller: xarm
+  - grip_planner: simple
+  - object_selector: nearest
+  - camera: realsense
+  - preview: default
+  - _self_
+
+# ── CAD models ─────────────────────────────────────────────────────────────────
+# Must be overridden. Each entry needs path (str) and id (str).
+# Example:
+#   cad_models:
+#     - path: /home/user/models/part.stl
+#       id: part
+
+cad_models:
+  - path: /home/joon/Downloads/cad_files/steering_knuckle/steering-knuckle-thunder-truck-r1-r.stl
+    id: part_steering
+
+# ── Arm positions and calibration ─────────────────────────────────────────────
+arm:
+  # Joint angles (radians) for the safe home / starting position
+  start_angles: [0.0, 0.7, 1.57, 0.0, 0.87, 0.0]
+
+  # Cartesian hover position above the pick region (metres, robot-base frame)
+  hover_position: [0.3, 0.0, 0.44]
+
+  # Target placement position (metres, robot-base frame)
+  placement_position: [0.35, 0.20, 0.20]
+
+  # Eye-on-hand calibration: 4×4 transform from camera frame to EE (last-joint) frame.
+  # This is FIXED — the camera is rigidly mounted on the wrist.
+  # At runtime: T_cam_base = fk_matrix(theta) @ T_cam_ee  (recomputed each capture).
+  # Generate with:  python scripts/calibrate_T_cam_base.py
+  # Set to null to disable pose-based arm control (camera-frame fallback only).
+  T_cam_ee:
+    - [0.00025418, -0.99999727, -0.00232349, -0.07129198]
+    - [0.99997105, 0.00027185, -0.00760430, -0.03078568]
+    - [0.00760491, -0.00232149, 0.99996839, -0.05597450]
+    - [0.00000000, 0.00000000, 0.00000000, 1.00000000]
+# ── Gripper limits ─────────────────────────────────────────────────────────────
+gripper:
+  min_grip_m: 0.02   # 20 mm  — narrowest object the gripper can hold
+  max_grip_m: 0.0375   # 37.5 mm  — widest object the gripper can open to
