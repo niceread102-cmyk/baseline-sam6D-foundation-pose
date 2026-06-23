@@ -1,26 +1,13 @@
 """Grip planning from CAD models.
 
-SimpleGripPlanner uses PCA to find principal axes, then does a slice-based
-scan to locate grippable regions:
-
-  For each axis (closing direction), the perpendicular plane is divided into an
-  n_scan_bins × n_scan_bins grid.  Each cell computes the local extent of mesh
-  vertices in the closing direction.  Cells where that local extent falls within
-  [min_grip_m, max_grip_m] are "grippable".
-
-  Connected grippable cells (4-connectivity) form a grip region.  Each region
-  becomes a GripCandidate whose position is the weighted centroid of the region,
-  biased toward the object centroid for stability.
-
-This correctly handles asymmetric objects (e.g. a steering knuckle) where the
-overall bounding box exceeds the gripper range but specific features (arms,
-bosses) do not.  The global-extent check used previously would miss all such
-features and always target the object centroid.
+SimpleGripPlanner uses PCA on mesh vertices to find principal axes, then
+checks which axes produce a grip width within [min_grip_m, max_grip_m].
+All dimensions are in metres, consistent with FoundationPose's effective_scale.
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -29,9 +16,30 @@ import numpy as np
 
 @dataclass
 class GripCandidate:
-    position_m: np.ndarray    # gripper jaw midpoint in object frame (metres, relative to centroid)
-    approach_axis: np.ndarray  # unit vector — gripper fingers close along this axis
-    width_m: float             # required opening width (metres)
+    """A single viable grip configuration in the object's local frame.
+
+    Attributes
+    ----------
+    position_m:
+        Gripper midpoint in object frame (metres).  ``SimpleGripPlanner`` always
+        sets this to ``[0, 0, 0]`` because the mesh is centred before PCA, so
+        the centroid is the origin.  The base-frame pick position is therefore
+        just the object's detected position: ``pick_xyz = R_obj @ [0,0,0] + p_obj``.
+
+        **Limitation**: centroid-as-pick-point is only reliable for roughly
+        symmetric, convex objects.  For elongated, multi-lobe, or heavily
+        asymmetric shapes a centroid grip may be mechanically infeasible even
+        though IK succeeds.
+    approach_axis:
+        Unit vector in object frame along which the gripper fingers close.
+        Transformed to base frame before planning: ``approach_base = R_obj @ approach_axis``.
+    width_m:
+        Required gripper opening width in metres.
+    """
+
+    position_m:    np.ndarray
+    approach_axis: np.ndarray
+    width_m:       float
 
 
 class GripPlanner(ABC):
@@ -41,144 +49,77 @@ class GripPlanner(ABC):
 
 
 class SimpleGripPlanner(GripPlanner):
-    """Slice-based grip planner.
+    """PCA-based grip planner.
 
-    Parameters
-    ----------
-    n_scan_bins:
-        Resolution of the perpendicular-plane grid used to find grippable
-        cross-sections.  Higher = finer detail but O(n²) cells; 20 is a good
-        default for objects in the 50–300 mm range.
-    min_pts_per_bin:
-        Minimum vertex count in a grid cell before its local width is trusted.
-        Raise if the mesh is very dense and you see phantom grips on thin shells.
+    For each CAD model:
+    1. Applies effective_scale (mesh_scale * physical_scale from FoundationPose) to
+       convert mesh vertices to metres.
+    2. Finds the 3 principal axes via SVD on the centred vertex cloud.
+    3. For each axis, the grip width is the point-cloud extent projected onto that axis.
+    4. Axes with width in [min_grip_m, max_grip_m] become GripCandidates.
     """
 
     def __init__(
         self,
-        cad_models: Any,
-        effective_scale: float,
+        cad_models: Any,          # list of DictConfig or objects with .path and .id
+        effective_scale: float,   # mesh_scale * physical_scale from FoundationPose cfg
         min_grip_m: float,
         max_grip_m: float,
-        n_scan_bins: int = 20,
-        min_pts_per_bin: int = 3,
     ):
         self._scale   = float(effective_scale)
         self._min     = float(min_grip_m)
         self._max     = float(max_grip_m)
-        self._n_bins  = int(n_scan_bins)
-        self._min_pts = int(min_pts_per_bin)
         self._grips: dict[str, list[GripCandidate]] = {}
 
         for model in cad_models:
             self._grips[model.id] = self._analyse(model.path)
 
-    # ── analysis ──────────────────────────────────────────────────────────────
-
     def _analyse(self, mesh_path: str | Path) -> list[GripCandidate]:
+        """Load mesh, find principal axes via SVD, and return valid grip candidates.
+
+        Steps
+        -----
+        1. Load mesh with trimesh; raise ``ValueError`` if the mesh is empty.
+        2. Scale vertices by ``effective_scale`` → metres.
+        3. Centre the cloud (subtract centroid) so PCA axes pass through the origin.
+        4. Compute SVD: rows of ``Vt`` are principal axes in descending variance.
+        5. For each axis, grip width = ``max − min`` projection along that axis.
+        6. Axes with width in ``[min_grip_m, max_grip_m]`` become ``GripCandidate``s.
+        7. Return sorted by ascending width (tightest grip first).
+        """
         import trimesh
 
-        mesh     = trimesh.load_mesh(str(mesh_path))
-        verts    = np.asarray(mesh.vertices, dtype=float) * self._scale
+        mesh = trimesh.load_mesh(str(mesh_path))
+        if len(mesh.vertices) == 0:
+            raise ValueError(
+                f"Mesh at '{mesh_path}' has no vertices — check the file path and format."
+            )
+        verts    = np.asarray(mesh.vertices, dtype=float) * self._scale  # → metres
         centroid = verts.mean(axis=0)
         centred  = verts - centroid
 
+        # PCA via SVD (rows of Vt are principal axes, descending variance)
         _, _, Vt = np.linalg.svd(centred, full_matrices=False)
 
         candidates: list[GripCandidate] = []
+        for axis in Vt[:3]:
+            axis = axis / np.linalg.norm(axis)
+            proj  = centred @ axis
+            width = float(proj.max() - proj.min())
+            if self._min <= width <= self._max:
+                candidates.append(
+                    GripCandidate(
+                        # Mesh is centered so the centroid is at the origin.
+                        # pick_xyz = R_obj @ [0,0,0] + p_obj_base = p_obj_base,
+                        # which is exactly the centroid in robot-base frame.
+                        position_m=np.zeros(3),
+                        approach_axis=axis,
+                        width_m=width,
+                    )
+                )
 
-        for i in range(3):
-            close_axis = Vt[i] / np.linalg.norm(Vt[i])
-            # The other two PCA axes span the perpendicular plane
-            perp = [Vt[j] / np.linalg.norm(Vt[j]) for j in range(3) if j != i]
-
-            u_c = centred @ close_axis  # projection onto closing axis  (N,)
-            u_1 = centred @ perp[0]     # projection onto perp axis 1   (N,)
-            u_2 = centred @ perp[1]     # projection onto perp axis 2   (N,)
-
-            n  = self._n_bins
-            e1 = np.linspace(u_1.min(), u_1.max(), n + 1)
-            e2 = np.linspace(u_2.min(), u_2.max(), n + 1)
-
-            grid_valid = np.zeros((n, n), dtype=bool)
-            grid_pos   = np.zeros((n, n, 3))   # 3D grip centre per cell
-            grid_width = np.zeros((n, n))       # local width per cell
-
-            for k1 in range(n):
-                mask1 = (u_1 >= e1[k1]) & (u_1 < e1[k1 + 1])
-                if not mask1.any():
-                    continue
-                for k2 in range(n):
-                    mask = mask1 & (u_2 >= e2[k2]) & (u_2 < e2[k2 + 1])
-                    if mask.sum() < self._min_pts:
-                        continue
-                    w = float(u_c[mask].max() - u_c[mask].min())
-                    if self._min <= w <= self._max:
-                        grid_valid[k1, k2] = True
-                        # Grip centre in closing direction: midpoint of jaw span.
-                        # Grip centre in perp directions: centroid of vertices in cell.
-                        close_mid = float(u_c[mask].max() + u_c[mask].min()) / 2.0
-                        grid_pos[k1, k2] = (
-                            close_mid            * close_axis
-                            + u_1[mask].mean() * perp[0]
-                            + u_2[mask].mean() * perp[1]
-                        )
-                        grid_width[k1, k2] = w
-
-            if not grid_valid.any():
-                continue
-
-            # Each connected group of grippable cells → one GripCandidate
-            labeled, n_comps = _label_connected(grid_valid)
-
-            for cid in range(1, n_comps + 1):
-                comp      = labeled == cid
-                positions = grid_pos[comp]    # (K, 3)
-                widths    = grid_width[comp]  # (K,)
-
-                # Bias grip position toward object centroid (0, 0, 0) for balance.
-                # sigma = mean distance of this region from centroid; positions
-                # at the mean distance get weight exp(-1) ≈ 0.37.
-                dists   = np.linalg.norm(positions, axis=1)
-                sigma   = max(float(dists.mean()), 1e-3)
-                weights = np.exp(-dists / sigma)
-
-                grip_pos   = np.average(positions, axis=0, weights=weights)
-                grip_width = float(np.average(widths, weights=weights))
-
-                candidates.append(GripCandidate(
-                    position_m=grip_pos,
-                    approach_axis=close_axis.copy(),
-                    width_m=grip_width,
-                ))
-
-        # Closest to centroid first — selector iterates in this order
-        candidates.sort(key=lambda c: np.linalg.norm(c.position_m))
-        return candidates
+        # Tightest grip first (requires least opening)
+        return sorted(candidates, key=lambda c: c.width_m)
 
     def compute_grips(self, model_id: str) -> list[GripCandidate]:
         return self._grips.get(model_id, [])
-
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-
-def _label_connected(grid: np.ndarray) -> tuple[np.ndarray, int]:
-    """BFS connected-component labelling (4-connectivity) on a 2D bool grid."""
-    labels     = np.zeros_like(grid, dtype=int)
-    cid        = 0
-    rows, cols = grid.shape
-    for r in range(rows):
-        for c in range(cols):
-            if grid[r, c] and labels[r, c] == 0:
-                cid += 1
-                queue       = [(r, c)]
-                labels[r, c] = cid
-                while queue:
-                    cr, cc = queue.pop()
-                    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                        nr, nc = cr + dr, cc + dc
-                        if 0 <= nr < rows and 0 <= nc < cols:
-                            if grid[nr, nc] and labels[nr, nc] == 0:
-                                labels[nr, nc] = cid
-                                queue.append((nr, nc))
-    return labels, cid

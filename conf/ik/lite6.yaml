@@ -1,14 +1,19 @@
 # IK solver for UFactory Lite 6 (src/binpick/ik_solver.py — Lite6IKSolver)
 # Kinematics extracted from arm_lite6/custom_ik.py; no ROS dependency.
+# For mathematical details see src/binpick/docs/IK_SOLVER.md.
 _target_: src.binpick.ik_solver.Lite6IKSolver
 
-# Damped Jacobian pseudoinverse parameters (see custom_ik.py for derivation)
-damping:    0.1    # regularisation term: prevents singularity blow-up
-alpha:      0.5    # step-size scaling
-max_steps:  200    # iteration cap
-threshold:  1.0e-3 # convergence tolerance (metres + radians combined norm)
+# Damped Jacobian pseudoinverse parameters
+damping:    0.1    # regularisation λ: prevents singularity blow-up (J Jᵀ + λ²I)⁻¹
+alpha:      0.5    # step-size scaling (0 < α ≤ 1); lower = more stable but slower
+max_steps:  200    # maximum Jacobian iterations before declaring failure
+threshold:  1.0e-3 # convergence threshold on ‖[dP; dW]‖ (metres + radians)
 step_clip:  0.1    # per-step joint velocity clamp (radians)
-jump_limit: 1.5    # max allowed joint angle change per move (safety, radians)
 
-# Fixed end-effector orientation [roll, pitch, yaw] in radians
-target_rpy: [3.14159265, 0.0, 0.0]   # [π, 0, 0] — gripper pointing straight down
+# Fixed end-effector orientation [roll, pitch, yaw] in radians (ZYX Euler)
+# Default [π, 0, 0] points the gripper straight down for top-down grasps.
+# Use solve_6dof() instead of solve() when you need a per-call orientation.
+target_rpy: [3.14159265, 0.0, 0.0]
+
+# Per-joint safety limit (radians) is set in conf/arm_controller/xarm.yaml
+# (max_joint_delta) — not here in the IK solver config.

@@ -1,18 +1,33 @@
 """RealSense D4xx RGBD camera wrapper.
 
 Mirrors the notebook configuration from sam6d_example.ipynb.
-Returns depth in millimetres (consistent with SAM6D/FoundationPose input convention).
+Returns depth in **millimetres** (consistent with SAM6D/FoundationPose convention).
 
 A background streaming thread continuously grabs frames so that:
-  - peek()    → non-blocking, always returns the latest frame (for live preview)
-  - capture() → blocks briefly until a fresh frame arrives (for inference)
+  - ``peek()``    → non-blocking, always returns the latest frame (for live preview)
+  - ``capture()`` → blocks briefly until a fresh frame arrives (for inference)
+
+Use the ``depth_units`` property to programmatically assert the output unit:
+``assert camera.depth_units == "mm"``
+
+Limitations
+-----------
+- Only a single RealSense device is supported.  If multiple devices are
+  connected, the first one found (``devices[0]``) is used.
+- No IR pattern avoidance or temporal filtering; depth noise may be elevated
+  when other IR emitters are nearby.
+- Advanced mode settings (disparity shift, depth clamp) are silently skipped
+  if the firmware version does not support them.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 class RealSenseCamera:
@@ -85,8 +100,12 @@ class RealSenseCamera:
             params.depthClampMin   = depth_min_mm
             params.depthClampMax   = depth_max_mm
             adv.set_depth_table(params)
-        except Exception:
-            pass  # advanced mode not available on all firmware versions
+        except Exception as e:
+            log.warning(
+                "RealSense advanced mode unavailable — disparity_shift and depth clamp "
+                "settings were NOT applied (%s). This is normal on some firmware versions.",
+                e,
+            )
 
         # Camera intrinsics
         intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
@@ -137,6 +156,16 @@ class RealSenseCamera:
     def K(self) -> np.ndarray:
         """3×3 camera intrinsic matrix."""
         return self._K.copy()
+
+    @property
+    def depth_units(self) -> str:
+        """Unit of the depth values returned by ``peek()`` and ``capture()``.
+
+        Always ``"mm"`` (millimetres).  SAM6D and FoundationPose both expect
+        depth in mm; this property exists so callers can assert the contract
+        rather than relying on documentation.
+        """
+        return "mm"
 
     def peek(self) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
         """Non-blocking: return the latest (rgb, depth, K), or None if not yet ready.

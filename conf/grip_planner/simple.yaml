@@ -1,12 +1,3 @@
-# Slice-based grip planner (src/binpick/grip_planner.py — SimpleGripPlanner)
+# PCA-based grip planner (src/binpick/grip_planner.py — SimpleGripPlanner)
 # cad_models, effective_scale, min_grip_m, max_grip_m injected by BinPicker.
 _target_: src.binpick.grip_planner.SimpleGripPlanner
-
-# Resolution of the perpendicular-plane grid used to find grippable cross-sections.
-# Each axis is scanned with an n × n grid; grippable cells become GripCandidates.
-# Increase for finer detail on small features; 20 works well for 50–300 mm objects.
-n_scan_bins: 20
-
-# Minimum vertex count in a grid cell to trust its local width measurement.
-# Raise if the mesh is dense and you see false grips on thin shells.
-min_pts_per_bin: 3

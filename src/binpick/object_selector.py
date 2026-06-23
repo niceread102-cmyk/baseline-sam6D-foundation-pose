@@ -24,10 +24,25 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class PickPlan:
-    fp_result:   dict           # FoundationPose result dict for chosen object
+    """Fully resolved pick-and-place plan returned by ``ObjectSelector.select()``.
+
+    Attributes
+    ----------
+    fp_result:
+        FoundationPose result dict for the chosen object.  Contains at least
+        ``"pose"`` (4×4 transform, camera frame, metres) and ``"model_id"``.
+    grip:
+        Selected ``GripCandidate`` (position and approach axis in object frame).
+    theta_pick:
+        IK solution (radians, shape (6,)) for the pick position in robot-base frame.
+    theta_place:
+        IK solution (radians, shape (6,)) for the placement position in robot-base frame.
+    """
+
+    fp_result:   dict
     grip:        GripCandidate
-    theta_pick:  np.ndarray    # IK solution for pick position
-    theta_place: np.ndarray    # IK solution for placement position
+    theta_pick:  np.ndarray
+    theta_place: np.ndarray
 
 
 class ObjectSelector(ABC):
@@ -68,14 +83,10 @@ class NearestObjectSelector(ObjectSelector):
         min_pick_height_m: float = 0.02,
         check_grip_orientation: bool = True,
         gripper_closing_axis: int = 1,
-        grasp_standoff_m: float = 0.0,
-        min_grip_centroid_dist_m: float = 0.0,
     ):
-        self._ik                 = ik_solver
-        self._place_xyz          = np.asarray(placement_position, dtype=float)
-        self._T_cb               = np.asarray(T_cam_base) if T_cam_base is not None else None
-        self._standoff           = float(grasp_standoff_m)
-        self._min_centroid_dist  = float(min_grip_centroid_dist_m)
+        self._ik        = ik_solver
+        self._place_xyz = np.asarray(placement_position, dtype=float)
+        self._T_cb      = np.asarray(T_cam_base) if T_cam_base is not None else None
 
         if self._T_cb is None:
             log.warning(
@@ -104,9 +115,34 @@ class NearestObjectSelector(ObjectSelector):
         current_theta: np.ndarray,
         T_cam_base: np.ndarray | None = None,
     ) -> PickPlan | None:
+        """Select the closest feasible object and return a resolved ``PickPlan``.
+
+        Parameters
+        ----------
+        fp_results:
+            List of FoundationPose result dicts.  Each dict must contain:
+            - ``"pose"``: 4×4 transform in **camera frame**, translation in **metres**.
+            - ``"model_id"``: string key into ``grips``.
+        grips:
+            Pre-computed grip candidates per model (``model_id → list[GripCandidate]``),
+            with positions and axes in **object frame**.
+        current_theta:
+            Current arm joint angles (radians), used to compute the EE position for
+            nearest-object ranking and as the IK seed for pick planning.
+        T_cam_base:
+            4×4 transform mapping camera-frame points to robot-base frame
+            (``p_base = T_cam_base @ p_cam_hom``).  Per-call value takes precedence
+            over the instance-level default.  Pass ``None`` to use the default.
+
+        Returns
+        -------
+        ``PickPlan`` for the closest feasible object/grip pair, or ``None`` if no
+        feasible plan was found.
+        """
         # Per-call T_cam_base takes precedence; fall back to instance-level (fixed-camera mode)
         T_cb = np.asarray(T_cam_base) if T_cam_base is not None else self._T_cb
 
+        current_ee, _ = self._ik.fk(current_theta)
         best: PickPlan | None = None
         best_dist = float("inf")
 
@@ -155,56 +191,23 @@ class NearestObjectSelector(ObjectSelector):
                     approach_base[0], approach_base[1], approach_base[2],
                 )
 
-                # Skip grips too close to the object centroid (hub region)
-                if self._min_centroid_dist > 0.0:
-                    centroid_dist = float(np.linalg.norm(grip.position_m))
-                    if centroid_dist < self._min_centroid_dist:
-                        log.info(
-                            "  SKIP grip #%d: centroid dist %.1fmm < min %.1fmm",
-                            i_grip, centroid_dist * 1000, self._min_centroid_dist * 1000,
-                        )
-                        continue
-
                 # Feasibility: height + optional 6-DOF orientation check
                 ok_feas, reason = self._feasibility.check(pick_xyz, approach_base, current_theta)
                 if not ok_feas:
                     log.info("  SKIP grip #%d: %s", i_grip, reason)
                     continue
 
-                # 6-DOF pick IK: position + grip orientation.
-                # Apply standoff so the EE flange is offset from the jaw contact
-                # point by grasp_standoff_m along the approach direction.
-                # approach_dir = first column of target_R (EE X-axis in base frame).
-                target_R    = self._feasibility.build_pick_orientation(approach_base)
-                approach_dir = target_R[:, 0]
-                pick_xyz_ee  = pick_xyz - self._standoff * approach_dir
-                theta_pick, ok_pick = self._ik.solve_6dof(pick_xyz_ee, target_R, current_theta)
+                theta_pick, ok_pick = self._ik.solve(pick_xyz, current_theta)
                 if not ok_pick:
-                    log.info("  SKIP grip #%d: 6-DOF pick IK failed", i_grip)
+                    log.info("  SKIP grip #%d: position IK failed", i_grip)
                     continue
-                log.info(
-                    "  Grip #%d pick_xyz=[%.3f,%.3f,%.3f] standoff=%.3fm "
-                    "→ EE target=[%.3f,%.3f,%.3f]",
-                    i_grip,
-                    pick_xyz[0], pick_xyz[1], pick_xyz[2],
-                    self._standoff,
-                    pick_xyz_ee[0], pick_xyz_ee[1], pick_xyz_ee[2],
-                )
 
                 theta_place, ok_place = self._ik.solve(self._place_xyz, theta_pick)
                 if not ok_place:
                     log.info("  SKIP grip #%d: place IK failed", i_grip)
                     continue
 
-                # Score by joint-space distance from hover rather than cartesian distance.
-                # Cartesian distance penalises grips on the object arm (farther from EE)
-                # while systematically favouring hub-area grips that close along the robot's
-                # forward (base-X) axis — those require joint 4/6 rotations of >80° to align
-                # the closing direction, which swings the eye-on-hand camera sideways into a
-                # wall and makes the place move exceed max_joint_delta.
-                # Joint-space distance from hover naturally penalises those large wrist
-                # rotations and prefers grips that close in the ±Y direction.
-                dist = float(np.linalg.norm(theta_pick - current_theta))
+                dist = float(np.linalg.norm(pick_xyz - current_ee))
                 if dist < best_dist:
                     best_dist = dist
                     best = PickPlan(
@@ -213,11 +216,7 @@ class NearestObjectSelector(ObjectSelector):
                         theta_pick=theta_pick,
                         theta_place=theta_place,
                     )
-                    log.info(
-                        "  → new best grip #%d  joint_dist=%.3frad  pick_xyz=[%.3f,%.3f,%.3f]",
-                        i_grip, dist,
-                        pick_xyz[0], pick_xyz[1], pick_xyz[2],
-                    )
+                    log.info("  → new best grip #%d  dist=%.3fm", i_grip, dist)
 
         if best is None:
             log.warning("No feasible pick plan found for any detected object.")

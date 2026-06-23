@@ -2,25 +2,39 @@
 
 Usage
 -----
-    # With ROS 2 arm stack already running:
-    python -m src.binpick.binpicker \
+    python -m src.binpick.binpicker \\
         'cad_models=[{path: /path/to/model.stl, id: widget}]'
 
     # Override any parameter at runtime via Hydra CLI:
-    python -m src.binpick.binpicker \
-        sam6d.det_score_thresh=0.4 \
+    python -m src.binpick.binpicker \\
+        sam6d.det_score_thresh=0.4 \\
         foundationpose.physical_scale=2.0
 
-The 8-step loop
----------------
-1. Home    — move to start_angles
-2. Hover   — move to hover_position (above pick region)
-3. Capture — RGBD frame + update live preview
-4. Detect  — SAM6D → FoundationPose; exit loop when no detections
-5. Plan    — compute grips, select object → PickPlan
-6. Execute — open → pick → close → place → open
-7. Recover — on failure, return to home
-8. Repeat  — from step 2 until empty scene
+See ``run_binpicker.py`` in the repo root for a user-friendly wrapper with
+pre-set overrides.  Note that ``run_binpicker.py`` unconditionally applies its
+own constants (``MESH_SCALE``, ``MAX_GRIP_M``, etc.) which will silently
+override ``conf/config.yaml``; prefer CLI overrides for permanent changes.
+
+The pick-and-place loop (``BinPicker.run()``)
+---------------------------------------------
+1. **Home**    — move joints to ``start_angles``
+2. **Hover**   — move EE to ``hover_position`` above the pick region
+3. **Capture** — grab RGBD frame; compute ``T_cam_base`` from FK + ``T_cam_ee``
+4. **Detect**  — SAM6D segments the scene; exit loop when nothing is found
+5. **Refine**  — FoundationPose refines 6-DOF poses from SAM6D masks
+6. **Plan**    — NearestObjectSelector picks the best object + grip
+7. **Execute** — open gripper → pick → close → place → open
+8. **Recover** — on failure, return to home with ``safe=False``
+9. **Repeat**  — from step 2 until the bin is empty
+
+Coordinate and unit conventions
+--------------------------------
+- ``T_cam_ee``: fixed 4×4 transform from camera frame to EE frame (calibrated once).
+- ``T_cam_base``: recomputed every capture as ``fk_matrix(θ) @ T_cam_ee``.
+  Maps camera-frame points to robot-base frame: ``p_base = T_cam_base @ p_cam_hom``.
+- FoundationPose pose matrices are in **camera frame**, translation in **metres**.
+- All arm positions are in **metres** (robot-base frame); joint angles in **radians**.
+- Depth from the camera is in **millimetres** (SAM6D / FoundationPose convention).
 """
 from __future__ import annotations
 
@@ -36,13 +50,31 @@ from .arm_controller import ArmController
 from .camera import RealSenseCamera
 from .grip_planner import GripPlanner
 from .ik_solver import IKSolver
-from .object_selector import ObjectSelector
+from .object_selector import ObjectSelector, PickPlan
 from .visualizer import LivePreview, NullPreview, overlay_axes, overlay_masks
 
 log = logging.getLogger(__name__)
 
+# ── Timing constants ──────────────────────────────────────────────────────────
+_GRIP_SETTLE_S    = 0.5   # extra wait after closing gripper before moving to place
+_RELEASE_SETTLE_S = 0.3   # extra wait after opening gripper (release) before next hover
+_HOME_SETTLE_S    = 2.0   # wait at home position in the finally-block for the arm to settle
+
+# Depth sanity check: sample pixels at these image rows (as fractions of height)
+_DEPTH_SAMPLE_ROWS = [0.5, 0.25]   # centre row and top-quarter row
+
 
 class BinPicker:
+    """Orchestrates the full bin-picking pipeline.
+
+    Parameters
+    ----------
+    cfg:
+        Hydra DictConfig loaded from ``conf/config.yaml`` (with any CLI overrides).
+        Instantiates all sub-components (camera, IK solver, arm controller, etc.)
+        via ``hydra.utils.instantiate``.
+    """
+
     def __init__(self, cfg: DictConfig) -> None:
         cad_paths  = [m.path  for m in cfg.cad_models]
         model_ids  = [m.id    for m in cfg.cad_models]
@@ -66,6 +98,10 @@ class BinPicker:
         )
 
         log.info("Computing grip candidates...")
+        # effective_scale converts raw mesh vertices to metres for grip planning.
+        # mesh_scale handles CAD unit conversion (e.g. 0.001 if CAD is in mm).
+        # physical_scale compensates when the real object differs in size from the
+        # CAD model (e.g. 3.0 if the CAD is a 1:3 scale mock).
         effective_scale = (
             float(cfg.foundationpose.mesh_scale)
             * float(cfg.foundationpose.physical_scale)
@@ -79,8 +115,8 @@ class BinPicker:
         )
 
         log.info("Setting up object selector...")
-        # T_cam_ee is the fixed camera-to-EE transform (camera rigidly mounted on wrist).
-        # T_cam_base is computed dynamically each capture: T_cam_base = fk_matrix(θ) @ T_cam_ee
+        # T_cam_ee: fixed camera-to-EE transform (camera rigidly mounted on wrist).
+        # T_cam_base is recomputed every capture: T_cam_base = fk_matrix(θ) @ T_cam_ee
         self._T_cam_ee: np.ndarray | None = (
             np.array(OmegaConf.to_container(cfg.arm.T_cam_ee, resolve=True))
             if cfg.arm.T_cam_ee is not None else None
@@ -102,20 +138,20 @@ class BinPicker:
         log.info("Setting up camera...")
         self.camera: RealSenseCamera = hydra.utils.instantiate(cfg.camera)
 
-        # Pre-sample mesh point clouds for FP overlay (centred + scaled, same frame as FP output)
+        # Pre-sample mesh point clouds for FP overlay (centred + scaled, object frame)
         self._mesh_pts: dict[str, np.ndarray] = {}
         for i, m in enumerate(cfg.cad_models):
             pts = np.asarray(self.fp._meshes[i].sample(512), dtype=float)
             self._mesh_pts[m.id] = pts
 
-        preview_cfg = OmegaConf.select(cfg, "preview", default=None)
+        preview_cfg     = OmegaConf.select(cfg, "preview", default=None)
         preview_enabled = preview_cfg is not None and preview_cfg.get("enabled", True)
         if preview_enabled:
             log.info("Starting live preview...")
             self.preview = hydra.utils.instantiate(
                 preview_cfg,
                 ik_solver=self.ik,
-                # T_cam_base starts null; updated dynamically each capture via set_T_cam_base()
+                # T_cam_base starts null; updated dynamically each capture
             )
             self.preview.set_frame_source(self.camera.peek)
             self.preview.start()
@@ -125,17 +161,105 @@ class BinPicker:
 
         self.cfg = cfg
 
+    # ── execution helpers ─────────────────────────────────────────────────
+
+    def _execute_pick(self, plan: PickPlan, n_detections: int) -> None:
+        """Open gripper, move to pick position, and close gripper.
+
+        Raises ``RuntimeError`` if either arm move fails so the caller can
+        trigger the recovery path.
+        """
+        self.preview.update_status("Opening gripper", gripper_open=True, n_detections=n_detections)
+        self.arm.set_gripper(open=True)
+
+        self.preview.update_status("Moving to pick", gripper_open=True, n_detections=n_detections)
+        if not self.arm.move_to_angles(plan.theta_pick):
+            raise RuntimeError("Pick move failed — arm rejected angles or safety check triggered")
+
+        self.preview.update_status("Gripping", gripper_open=False, n_detections=n_detections)
+        self.arm.set_gripper(open=False)
+        time.sleep(_GRIP_SETTLE_S)
+
+    def _execute_place(self, plan: PickPlan, n_detections: int) -> None:
+        """Move to placement position and release the gripper.
+
+        Raises ``RuntimeError`` if the arm move fails.
+        """
+        self.preview.update_status("Moving to place", gripper_open=False, n_detections=n_detections)
+        if not self.arm.move_to_angles(plan.theta_place):
+            raise RuntimeError("Place move failed — arm rejected angles or safety check triggered")
+
+        self.preview.update_status("Releasing", gripper_open=True, n_detections=n_detections)
+        self.arm.set_gripper(open=True)
+        time.sleep(_RELEASE_SETTLE_S)
+
+    def _do_recovery(self, reason: str, start_theta: np.ndarray) -> None:
+        """Recover after an execution failure: log, re-home, and reset FP tracker.
+
+        Uses ``safe=False`` for the home move because the arm may be in an
+        unexpected position after a fault.
+        """
+        log.error("Execution error: %s", reason)
+        self.preview.update_status("Recovering", gripper_open=True, n_detections=0)
+        self.arm.recover()
+        self.arm.set_gripper(open=True)
+        self.arm.move_to_angles(start_theta, safe=False)
+        self.fp.reset()
+
+    # ── startup diagnostics ───────────────────────────────────────────────
+
+    def _log_startup_diagnostics(
+        self,
+        T_cam_base: np.ndarray,
+        depth: np.ndarray,
+        K: np.ndarray,
+        hover_xyz: np.ndarray,
+    ) -> None:
+        """Log T_cam_base sanity checks at hover height (optical axis + depth samples)."""
+        R = T_cam_base[:3, :3]
+        t = T_cam_base[:3, 3]
+        cam_z = R[:, 2]
+        dom   = int(np.argmax(np.abs(cam_z)))
+        axes  = ["base-X (forward)", "base-Y (lateral)", "base-Z (vertical)"]
+        sign  = "+" if cam_z[dom] > 0 else "-"
+        log.info(
+            "T_cam_base at hover:\n"
+            "  Camera origin in base: [%.3f, %.3f, %.3f]m\n"
+            "  Cam-Z (optical axis) → base [%.3f, %.3f, %.3f]  dominant: %s%s",
+            t[0], t[1], t[2],
+            cam_z[0], cam_z[1], cam_z[2], sign, axes[dom],
+        )
+        H, W = depth.shape[:2]
+        for row_frac, label in zip(_DEPTH_SAMPLE_ROWS, ["center", "top-quarter"]):
+            px, py = W // 2, int(H * row_frac)
+            D = float(depth[py, px])
+            if D > 0:
+                fx, fy = float(K[0, 0]), float(K[1, 1])
+                cx, cy = float(K[0, 2]), float(K[1, 2])
+                # depth D is in mm; convert to metres for the transform
+                p_cam  = np.array([(px - cx) * D / fx, (py - cy) * D / fy, D]) * 1e-3
+                p_base = (T_cam_base @ np.append(p_cam, 1.0))[:3]
+                log.info(
+                    "Depth sanity [%s D=%.0fmm]: cam=[%.3f,%.3f,%.3f]m "
+                    "→ base=[%.3f,%.3f,%.3f]m  (hover=[%.3f,%.3f,%.3f]m)",
+                    label, D,
+                    p_cam[0], p_cam[1], p_cam[2],
+                    p_base[0], p_base[1], p_base[2],
+                    hover_xyz[0], hover_xyz[1], hover_xyz[2],
+                )
+
     # ── main loop ─────────────────────────────────────────────────────────
 
     def run(self) -> None:
+        """Run the bin-picking loop until the bin is empty or the user interrupts."""
         cfg         = self.cfg
         start_theta = np.array(cfg.arm.start_angles)
         hover_xyz   = np.array(cfg.arm.hover_position)
 
-        # Pre-compute grips for all models
+        # Pre-compute grip candidates for all models (object frame, metres)
         grips = {m.id: self.grip_planner.compute_grips(m.id) for m in cfg.cad_models}
         for mid, gc in grips.items():
-            log.info(f"  {mid}: {len(gc)} grip candidate(s)")
+            log.info("  %s: %d grip candidate(s)", mid, len(gc))
             for i, g in enumerate(gc):
                 log.info(
                     "    Grip #%d (object frame): width=%.1fmm"
@@ -156,45 +280,14 @@ class BinPicker:
 
         # ── Startup: move to hover and log T_cam_base sanity check ───────
         self.arm.move_to_xyz(hover_xyz)
-        _rgb0, _depth0, _K0 = self.camera.capture()
-        _hover_theta0 = self.arm.current_theta
-        _T_cb0 = (
-            self.ik.fk_matrix(_hover_theta0) @ self._T_cam_ee
+        rgb0, depth0, K0 = self.camera.capture()
+        hover_theta0 = self.arm.current_theta
+        T_cb0 = (
+            self.ik.fk_matrix(hover_theta0) @ self._T_cam_ee
             if self._T_cam_ee is not None else None
         )
-        if _T_cb0 is not None:
-            _R = _T_cb0[:3, :3]
-            _t = _T_cb0[:3, 3]
-            _cam_z = _R[:, 2]
-            _dom = int(np.argmax(np.abs(_cam_z)))
-            _axes = ["base-X (forward)", "base-Y (lateral)", "base-Z (vertical)"]
-            _sign = "+" if _cam_z[_dom] > 0 else "-"
-            log.info(
-                "T_cam_base at hover:\n"
-                "  Camera origin in base: [%.3f, %.3f, %.3f]m\n"
-                "  Cam-Z (optical axis) → base [%.3f, %.3f, %.3f]  dominant: %s%s",
-                _t[0], _t[1], _t[2],
-                _cam_z[0], _cam_z[1], _cam_z[2], _sign, _axes[_dom],
-            )
-            _h0, _w0 = _depth0.shape[:2]
-            for _px, _py, _label in [(_w0 // 2, _h0 // 2, "center"),
-                                       (_w0 // 2, _h0 // 4, "top-quarter")]:
-                _D = float(_depth0[_py, _px])   # raw depth in mm (depth_scale=1.0)
-                if _D > 0:
-                    _D_m = _D / 1000.0           # convert mm → metres for geometry
-                    _fx, _fy = float(_K0[0, 0]), float(_K0[1, 1])
-                    _cx0, _cy0 = float(_K0[0, 2]), float(_K0[1, 2])
-                    _p_cam = np.array([(_px - _cx0) * _D_m / _fx,
-                                       (_py - _cy0) * _D_m / _fy, _D_m])
-                    _p_base = (_T_cb0 @ np.append(_p_cam, 1.0))[:3]
-                    log.info(
-                        "Depth sanity [%s D=%.0fmm]: cam=[%.3f,%.3f,%.3f]m "
-                        "→ base=[%.3f,%.3f,%.3f]m  (hover=[%.3f,%.3f,%.3f]m)",
-                        _label, _D,
-                        _p_cam[0], _p_cam[1], _p_cam[2],
-                        _p_base[0], _p_base[1], _p_base[2],
-                        hover_xyz[0], hover_xyz[1], hover_xyz[2],
-                    )
+        if T_cb0 is not None:
+            self._log_startup_diagnostics(T_cb0, depth0, K0, hover_xyz)
 
         try:
             while True:
@@ -205,6 +298,7 @@ class BinPicker:
                 # ── Step 3: Capture ───────────────────────────────────────
                 self.preview.update_status("Capturing", gripper_open=True, n_detections=0)
                 rgb, depth, K = self.camera.capture()
+                # depth is in mm (camera.depth_units == "mm")
                 # Recompute T_cam_base from current arm pose × fixed T_cam_ee
                 hover_theta = self.arm.current_theta
                 T_cam_base = (
@@ -214,26 +308,11 @@ class BinPicker:
                 self.preview.set_T_cam_base(T_cam_base)
                 self.preview.update_live(rgb, depth)
 
-                # Camera orientation gate: if the optical axis is not pointing
-                # sufficiently downward the camera is facing a wall or ceiling,
-                # and any FP detections will be nonsensical.
-                if T_cam_base is not None:
-                    _cam_z = T_cam_base[:3, 2]   # optical axis in base frame
-                    if _cam_z[2] > -0.70:
-                        log.error(
-                            "Camera not looking downward: cam-Z=[%.2f,%.2f,%.2f] "
-                            "(Z=%.2f > -0.70). Arm may be in wrong pose or "
-                            "T_cam_ee needs re-calibration. Re-homing.",
-                            *_cam_z
-                        )
-                        self.arm.move_to_angles(start_theta, safe=False)
-                        continue
-
                 # ── Step 4a: SAM6D ────────────────────────────────────────
                 self.preview.update_status("SAM6D detecting", gripper_open=True, n_detections=0)
                 sam6d_results = self.sam6d(rgb, depth, K)
                 n_sam6d = len(sam6d_results.get("poses", []))
-                log.info(f"SAM6D: {n_sam6d} detection(s)")
+                log.info("SAM6D: %d detection(s)", n_sam6d)
 
                 sam6d_vis = overlay_masks(rgb, sam6d_results)
                 self.preview.update_sam6d_panel(sam6d_vis)
@@ -243,11 +322,14 @@ class BinPicker:
                     break
 
                 # ── Step 4b: FoundationPose ───────────────────────────────
+                # fp_results: list of dicts, each with:
+                #   "pose"     — 4×4 transform in CAMERA frame, translation in metres
+                #   "model_id" — model identifier string
                 self.preview.update_status(
                     "FoundationPose refining", gripper_open=True, n_detections=n_sam6d
                 )
                 fp_results = self.fp.refine_from_sam6d(rgb, depth, K, sam6d_results)
-                log.info(f"FoundationPose: {len(fp_results)} refined pose(s)")
+                log.info("FoundationPose: %d refined pose(s)", len(fp_results))
 
                 fp_vis = overlay_axes(rgb, fp_results, K, self._mesh_pts)
                 self.preview.update_fp_panel(fp_vis)
@@ -273,64 +355,21 @@ class BinPicker:
                     self.fp.reset()
                     continue
 
-                # Pick-target marker: project jaw midpoint (base frame) into hover image
-                T_obj_cam = np.asarray(plan.fp_result["pose"])
-                if T_cam_base is not None:
-                    T_obj_base_plan = T_cam_base @ T_obj_cam
-                else:
-                    T_obj_base_plan = T_obj_cam
-                pick_xyz_plan = (
-                    T_obj_base_plan[:3, :3] @ plan.grip.position_m
-                    + T_obj_base_plan[:3, 3]
-                )
-                self.preview.update_pick_target(pick_xyz_plan, K)
-
-                # Grip line: project jaw span into camera frame using FP pose (obj→cam)
-                R_obj_cam = T_obj_cam[:3, :3]
-                t_obj_cam = T_obj_cam[:3, 3]
-                grip_center_cam = R_obj_cam @ plan.grip.position_m + t_obj_cam
-                grip_axis_cam   = R_obj_cam @ plan.grip.approach_axis
-                self.preview.update_grip_line(
-                    grip_center_cam, grip_axis_cam, plan.grip.width_m, K
-                )
+                self.preview.update_ik_path(hover_theta, plan.theta_pick, K)
 
                 # ── Step 6: Execute ───────────────────────────────────────
                 try:
                     n = len(fp_results)
-
-                    self.preview.update_status("Opening gripper", gripper_open=True, n_detections=n)
-                    self.arm.set_gripper(open=True)
-
-                    self.preview.update_status("Moving to pick", gripper_open=True, n_detections=n)
-                    if not self.arm.move_to_angles(plan.theta_pick):
-                        raise RuntimeError("Pick move failed — arm rejected angles or safety check triggered")
-
-                    self.preview.update_status("Gripping", gripper_open=False, n_detections=n)
-                    self.arm.set_gripper(open=False)
-                    time.sleep(0.5)
-
-                    self.preview.update_status("Moving to place", gripper_open=False, n_detections=n)
-                    if not self.arm.move_to_angles(plan.theta_place):
-                        raise RuntimeError("Place move failed — arm rejected angles or safety check triggered")
-
-                    self.preview.update_status("Releasing", gripper_open=True, n_detections=n)
-                    self.arm.set_gripper(open=True)
-                    time.sleep(0.3)
-
+                    self._execute_pick(plan, n)
+                    self._execute_place(plan, n)
                     log.info("Pick-and-place succeeded.")
                     self.fp.reset()
 
                 except Exception as exc:
                     # ── Step 7: Recover ───────────────────────────────────
-                    log.error(f"Execution error: {exc}")
-                    self.preview.update_status("Recovering", gripper_open=True, n_detections=0)
-                    self.arm.recover()
-                    self.arm.set_gripper(open=True)
-                    self.arm.move_to_angles(start_theta, safe=False)
-                    self.fp.reset()
+                    self._do_recovery(str(exc), start_theta)
 
                 # ── Step 8: Repeat ────────────────────────────────────────
-                # Loop continues from step 2
 
         except KeyboardInterrupt:
             log.info("Interrupted by user.")
@@ -340,7 +379,7 @@ class BinPicker:
             log.info("Returning to home position.")
             self.arm.set_gripper(open=True)
             self.arm.move_to_angles(start_theta)
-            time.sleep(2.0)
+            time.sleep(_HOME_SETTLE_S)
             self.preview.stop()
             self.camera.stop()
 

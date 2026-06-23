@@ -25,12 +25,34 @@ from typing import Any
 import cv2
 import numpy as np
 
-# Colour palette for per-detection overlays (BGR for OpenCV)
+# Colour palette for per-detection overlays (BGR for OpenCV, cycled modulo len)
 _PALETTE = [
-    (0, 120, 255), (0, 200, 80), (220, 60, 0),
-    (180, 0, 220), (0, 200, 200), (220, 180, 0),
-    (120, 0, 160), (0, 160, 120), (200, 100, 0),
+    (0, 120, 255),   # orange
+    (0, 200, 80),    # green
+    (220, 60, 0),    # blue
+    (180, 0, 220),   # purple
+    (0, 200, 200),   # cyan
+    (220, 180, 0),   # teal
+    (120, 0, 160),   # magenta
+    (0, 160, 120),   # lime
+    (200, 100, 0),   # steel blue
 ]
+
+# Mask overlay blending weights: original image vs detection colour
+_MASK_BLEND_ORIGINAL = 0.45
+_MASK_BLEND_COLOUR   = 0.55
+
+# Default axis arrow length for FoundationPose overlays (metres)
+_AXIS_LEN_M = 0.02
+
+# Maximum number of point-cloud dots drawn per detection (for display performance)
+_PC_MAX_PTS = 500
+
+# Depth colourmap blend fraction (fraction of depth-colourmap vs RGB)
+_DEPTH_BLEND_FRAC = 0.3
+
+# JPEG snapshot save interval (seconds) when capture_dir is set
+_SNAPSHOT_INTERVAL_S = 1.0
 
 
 def _resize(img: np.ndarray, w: int, h: int) -> np.ndarray:
@@ -60,7 +82,7 @@ def overlay_masks(rgb: np.ndarray, results: dict | None) -> np.ndarray:
     for i, mask in enumerate(masks):
         colour = np.array(_PALETTE[i % len(_PALETTE)], dtype=np.float32)  # BGR
         colour_rgb = colour[[2, 1, 0]]  # → RGB
-        overlay[mask] = overlay[mask] * 0.45 + colour_rgb * 0.55
+        overlay[mask] = overlay[mask] * _MASK_BLEND_ORIGINAL + colour_rgb * _MASK_BLEND_COLOUR
 
     vis = overlay.clip(0, 255).astype(np.uint8)
 
@@ -84,8 +106,8 @@ def overlay_axes(
     fp_results: list[dict] | None,
     K: np.ndarray,
     mesh_pts_by_model: dict[str, np.ndarray] | None = None,
-    axis_len_m: float = 0.02,
-    n_pts: int = 500,
+    axis_len_m: float = _AXIS_LEN_M,
+    n_pts: int = _PC_MAX_PTS,
 ) -> np.ndarray:
     """Draw FoundationPose axes (and optional point clouds) on a copy of rgb.
 
@@ -195,11 +217,10 @@ class LivePreview(threading.Thread):
         self._p_fp     = black.copy()
 
         # Status state
-        self._stage           = "Initializing"
-        self._gripper_open    = True
-        self._n_detections    = 0
-        self._pick_target_uv: tuple[int, int] | None = None
-        self._grip_line_uv:   tuple | None = None  # (uv_jaw1, uv_center, uv_jaw2)
+        self._stage         = "Initializing"
+        self._gripper_open  = True
+        self._n_detections  = 0
+        self._ik_path_uv: list[tuple[int, int]] | None = None
 
         # Optional callback for continuous live feed: () -> (rgb, depth, K) | None
         self._frame_source = None
@@ -235,9 +256,6 @@ class LivePreview(threading.Thread):
         p = _resize(panel_rgb, self._pw, self._ph)
         with self._lock:
             self._p_fp = p
-            # Clear plan overlays; they'll be repopulated if a plan is found this cycle
-            self._pick_target_uv = None
-            self._grip_line_uv = None
 
     def update_status(self, stage: str, gripper_open: bool, n_detections: int) -> None:
         with self._lock:
@@ -245,84 +263,49 @@ class LivePreview(threading.Thread):
             self._gripper_open = gripper_open
             self._n_detections = n_detections
 
-    def update_pick_target(self, pick_xyz_base: np.ndarray, K: np.ndarray) -> None:
-        """Project the planned jaw midpoint (base frame) into the FP hover-image panel.
-
-        Uses the T_cam_base stored from the last hover capture, so the marker
-        aligns with the static hover snapshot shown in the FP panel.
-        """
-        if self._T_cb is None:
-            return
-
-        T_base_to_cam = np.linalg.inv(self._T_cb)
-        p_cam = T_base_to_cam[:3, :3] @ np.asarray(pick_xyz_base, dtype=float) + T_base_to_cam[:3, 3]
-        if p_cam[2] <= 1e-6:
-            return
-
-        K = np.asarray(K, dtype=float)
-        u = int(K[0, 0] * p_cam[0] / p_cam[2] + K[0, 2])
-        v = int(K[1, 1] * p_cam[1] / p_cam[2] + K[1, 2])
-
-        sx = self._pw / 640.0
-        sy = self._ph / 480.0
-        u_s = int(u * sx)
-        v_s = int(v * sy)
-
-        if 0 <= u_s < self._pw and 0 <= v_s < self._ph:
-            with self._lock:
-                self._pick_target_uv = (u_s, v_s)
-        else:
-            with self._lock:
-                self._pick_target_uv = None
-
-    def update_grip_line(
+    def update_ik_path(
         self,
-        center_cam: np.ndarray,
-        axis_cam: np.ndarray,
-        width_m: float,
+        theta_start: np.ndarray,
+        theta_end: np.ndarray,
         K: np.ndarray,
     ) -> None:
-        """Project the gripper jaw span into the FP panel for overlay.
+        """Project IK waypoints to pixel coords for arrow overlay.
 
-        Draws from jaw1 = center - axis*(width/2) to jaw2 = center + axis*(width/2),
-        with perpendicular ticks at each jaw end to show the finger plates.
+        Requires T_cam_base and ik_solver to have been set at construction.
+        Does nothing (and emits no warning) if either is absent.
         """
-        K = np.asarray(K, dtype=float)
-        center_cam = np.asarray(center_cam, dtype=float)
-        axis = np.asarray(axis_cam, dtype=float)
-        norm = np.linalg.norm(axis)
-        if norm < 1e-9:
+        if self._ik is None or self._T_cb is None:
             return
-        axis = axis / norm
-        half = float(width_m) / 2.0
 
-        def _proj(p: np.ndarray) -> tuple[int, int] | None:
+        # Waypoints in robot-base frame
+        waypoints_base = self._ik.trajectory_xyz(theta_start, theta_end, n_steps=10)
+
+        # T_cam_base maps cam→base; invert to get base→cam for projection
+        T_base_to_cam = np.linalg.inv(self._T_cb)
+        R_bc = T_base_to_cam[:3, :3]
+        t_bc = T_base_to_cam[:3, 3]
+        pts_cam = (R_bc @ waypoints_base.T).T + t_bc
+
+        K = np.asarray(K, dtype=float)
+        uv_list: list[tuple[int, int]] = []
+        for p in pts_cam:
             if p[2] <= 1e-6:
-                return None
+                continue
             u = int(K[0, 0] * p[0] / p[2] + K[0, 2])
             v = int(K[1, 1] * p[1] / p[2] + K[1, 2])
-            return (u, v)
-
-        uv1 = _proj(center_cam - axis * half)
-        uv_c = _proj(center_cam)
-        uv2 = _proj(center_cam + axis * half)
-
-        if uv1 is None or uv_c is None or uv2 is None:
-            return
-
-        # Scale uvs to panel resolution
-        H_src, W_src = 480, 640  # source camera resolution
-        sx, sy = self._pw / W_src, self._ph / H_src
-        def scale_uv(uv):
-            return (int(uv[0] * sx), int(uv[1] * sy))
+            uv_list.append((u, v))
 
         with self._lock:
-            self._grip_line_uv = (scale_uv(uv1), scale_uv(uv_c), scale_uv(uv2))
+            self._ik_path_uv = uv_list if len(uv_list) >= 2 else None
 
     # ── panel rendering ───────────────────────────────────────────────────
 
     def _make_rgbd_panel(self, rgb: np.ndarray, depth: np.ndarray) -> np.ndarray:
-        """Blend depth colourmap (TURBO) at 30% over RGB."""
+        """Blend TURBO depth colourmap at ``_DEPTH_BLEND_FRAC`` opacity over RGB.
+
+        Only pixels with depth > 0 (valid returns) receive the colourmap blend;
+        zero-depth pixels (out-of-range or occluded) show the raw RGB only.
+        """
         d_valid = depth[depth > 0]
         if d_valid.size > 0:
             d_min, d_max = float(d_valid.min()), float(d_valid.max())
@@ -334,13 +317,18 @@ class LivePreview(threading.Thread):
         d_color = cv2.applyColorMap(d_u8, cv2.COLORMAP_TURBO)          # BGR
         d_rgb   = cv2.cvtColor(d_color, cv2.COLOR_BGR2RGB)
 
-        mask         = (depth > 0)[..., np.newaxis]
-        blended      = np.where(mask, rgb * 0.7 + d_rgb * 0.3, rgb).astype(np.uint8)
+        mask    = (depth > 0)[..., np.newaxis]
+        blended = np.where(
+            mask,
+            rgb * (1 - _DEPTH_BLEND_FRAC) + d_rgb * _DEPTH_BLEND_FRAC,
+            rgb,
+        ).astype(np.uint8)
         return _resize(blended, self._pw, self._ph)
 
     def _render_status(
         self, stage: str, gripper_open: bool, n_det: int, display_fps: float
     ) -> np.ndarray:
+        """Render the status text panel (bottom-right quadrant)."""
         panel = np.zeros((self._ph, self._pw, 3), dtype=np.uint8)
         lines = [
             ("BinPicker",                    (200, 200, 200), 0.7, 2),
@@ -357,7 +345,7 @@ class LivePreview(threading.Thread):
         if self._T_cb is None:
             lines += [
                 ("",                                   (0, 0, 0),    0.5, 1),
-                ("Pick target: N/A",                   (120, 80, 80), 0.4, 1),
+                ("IK path: N/A",                       (120, 80, 80), 0.4, 1),
                 ("(calibrate arm.T_cam_ee first)",     (100, 60, 60), 0.38, 1),
             ]
 
@@ -402,53 +390,30 @@ class LivePreview(threading.Thread):
                         self._p_live = panel
 
             with self._lock:
-                p_live       = self._p_live.copy()
-                p_sam6d      = self._p_sam6d.copy()
-                p_fp         = self._p_fp.copy()
-                stage        = self._stage
-                g_open       = self._gripper_open
-                n_det        = self._n_detections
-                pick_target  = self._pick_target_uv
-                grip_line    = self._grip_line_uv
+                p_live   = self._p_live.copy()
+                p_sam6d  = self._p_sam6d.copy()
+                p_fp     = self._p_fp.copy()
+                stage    = self._stage
+                g_open   = self._gripper_open
+                n_det    = self._n_detections
+                ik_path  = self._ik_path_uv
 
             # Convert RGB panels to BGR for OpenCV
             p_live_bgr  = _to_bgr(p_live)
             p_sam6d_bgr = _to_bgr(p_sam6d)
             p_fp_bgr    = _to_bgr(p_fp)
 
-            H, W = p_fp_bgr.shape[:2]
-
-            # Draw pick-target marker on FP panel: circle + crosshair at jaw midpoint
-            if pick_target is not None:
-                px, py = pick_target
-                cv2.circle(p_fp_bgr,    (px, py), 16, (0, 220, 255), 3, cv2.LINE_AA)
-                cv2.circle(p_fp_bgr,    (px, py),  4, (0, 220, 255), -1)
-                tick = 20
-                cv2.line(p_fp_bgr, (px - tick, py), (px + tick, py),
-                         (0, 220, 255), 2, cv2.LINE_AA)
-                cv2.line(p_fp_bgr, (px, py - tick), (px, py + tick),
-                         (0, 220, 255), 2, cv2.LINE_AA)
-
-            # Draw grip line (jaw span) on FP panel
-            if grip_line is not None:
-                uv1, uv_c, uv2 = grip_line
-                if (0 <= uv1[0] < W and 0 <= uv1[1] < H and
-                        0 <= uv2[0] < W and 0 <= uv2[1] < H):
-                    # Jaw span line
-                    cv2.line(p_fp_bgr, uv1, uv2, (0, 255, 120), 5, cv2.LINE_AA)
-                    # Center dot
-                    cv2.circle(p_fp_bgr, uv_c, 8, (0, 255, 120), -1)
-                    # Perpendicular jaw-plate ticks at each end
-                    dx = uv2[0] - uv1[0]
-                    dy = uv2[1] - uv1[1]
-                    span = max((dx * dx + dy * dy) ** 0.5, 1.0)
-                    pdx = int(-dy / span * 20)
-                    pdy = int(dx / span * 20)
-                    for uv_jaw in (uv1, uv2):
-                        cv2.line(p_fp_bgr,
-                                 (uv_jaw[0] - pdx, uv_jaw[1] - pdy),
-                                 (uv_jaw[0] + pdx, uv_jaw[1] + pdy),
-                                 (0, 200, 255), 3, cv2.LINE_AA)
+            # Draw IK path arrows on FP panel (in-place on BGR copy)
+            if ik_path is not None:
+                H, W = p_fp_bgr.shape[:2]
+                for j in range(len(ik_path) - 1):
+                    p0, p1 = ik_path[j], ik_path[j + 1]
+                    if not (0 <= p0[0] < W and 0 <= p0[1] < H):
+                        continue
+                    if not (0 <= p1[0] < W and 0 <= p1[1] < H):
+                        continue
+                    cv2.arrowedLine(p_fp_bgr, p0, p1,
+                                    (0, 255, 255), 2, tipLength=0.3, line_type=cv2.LINE_AA)
 
             p_status = self._render_status(stage, g_open, n_det, fps_actual)
 
@@ -472,10 +437,10 @@ class LivePreview(threading.Thread):
                 self._running = False
                 break
 
-            # Save a JPEG capture once per second
+            # Save a JPEG capture once per _SNAPSHOT_INTERVAL_S seconds
             if self._capture_dir is not None:
                 now = time.time()
-                if now - self._last_capture_t >= 1.0:
+                if now - self._last_capture_t >= _SNAPSHOT_INTERVAL_S:
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
                     cv2.imwrite(str(self._capture_dir / f"preview_{ts}.jpg"), composite)
                     self._last_capture_t = now
@@ -518,8 +483,5 @@ class NullPreview:
     def update_status(self, stage, gripper_open, n_detections) -> None:
         pass
 
-    def update_pick_target(self, pick_xyz_base, K) -> None:
-        pass
-
-    def update_grip_line(self, center_cam, axis_cam, width_m, K) -> None:
+    def update_ik_path(self, theta_start, theta_end, K) -> None:
         pass

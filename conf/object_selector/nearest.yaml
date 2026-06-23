@@ -6,17 +6,3 @@ _target_: src.binpick.object_selector.NearestObjectSelector
 min_pick_height_m: 0.02       # reject grip centroids below this Z in base frame (m)
 check_grip_orientation: true  # run 6-DOF IK to verify approach axis is reachable
 gripper_closing_axis: 1       # EE axis the gripper closes along: 0=X, 1=Y, 2=Z
-
-# Grasp standoff: distance (m) from jaw contact point to EE flange, measured along
-# the approach direction (EE X-axis). Set this to the physical distance from the
-# robot flange to the gripper jaw midpoint so the IK target is at the flange
-# position, not inside the object.
-# Tune by watching the pick-target marker in the FoundationPose panel: with the
-# correct value the marker should sit on the object surface.
-grasp_standoff_m: 0.17
-
-# Minimum distance (m) from the grip position to the object centroid.
-# Set > 0 to skip hub-region grips and force selection of arm-region grips.
-# Example: set 0.03 to skip grips within 30 mm of the centroid.
-# Default 0.0 = disabled (centroid-biased selection as normal).
-min_grip_centroid_dist_m: 0.0

@@ -32,6 +32,11 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
+# Minimum norm-squared of the approach component perpendicular to the closing axis.
+# If below this threshold the closing axis is considered vertical and the fallback
+# (X_base) is used as the approach direction instead.
+_VERTICAL_THRESHOLD = 1e-6
+
 
 class GripFeasibilityChecker:
     """Validates a grip candidate (in robot-base frame) before committing to IK.
@@ -103,10 +108,6 @@ class GripFeasibilityChecker:
 
         return True, "ok"
 
-    def build_pick_orientation(self, approach_axis_base: np.ndarray) -> np.ndarray:
-        """Target EE rotation for a grip approach axis (public access for the selector)."""
-        return self._build_target_R(approach_axis_base)
-
     # ── internal helpers ──────────────────────────────────────────────────────
 
     def _build_target_R(self, approach_axis_base: np.ndarray) -> np.ndarray:
@@ -127,7 +128,7 @@ class GripFeasibilityChecker:
         # Approach direction: downward in base frame, made perpendicular to closing
         down = np.array([0.0, 0.0, -1.0])
         approach_raw = down - np.dot(down, closing) * closing
-        if np.linalg.norm(approach_raw) < 1e-6:
+        if np.linalg.norm(approach_raw) < _VERTICAL_THRESHOLD:
             # closing is vertical — fall back to X_base as approach
             approach_raw = np.array([1.0, 0.0, 0.0])
             approach_raw = approach_raw - np.dot(approach_raw, closing) * closing
