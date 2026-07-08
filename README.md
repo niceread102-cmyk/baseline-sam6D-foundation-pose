@@ -49,6 +49,68 @@ If you like this project, check out related works from our group:
 - [PIZZA: A Powerful Image-only Zero-Shot Zero-CAD Approach to 6DoF Tracking (3DV 2022)](https://github.com/nv-nguyen/pizza)
 - [BOP visualization toolkit](https://github.com/nv-nguyen/bop_viz_kit)
 
+## SAM-6D + FoundationPose: live RGB-D pose pipeline (this repo)
+
+On top of the original CNOS baseline, this repo adds two wrapper classes for running a live RGB-D camera through detection, coarse pose estimation, and iterative pose refinement/tracking — rather than only evaluating against BOP benchmark datasets:
+
+- **[`src/sam6d.py`](./src/sam6d.py)** — `SAM6D` class. Wraps [SAM-6D](https://github.com/JiehongLin/SAM-6D)'s Instance Segmentation Model (SAM proposals + DINOv2 matching against rendered CAD templates) and Pose Estimation Model (transformer-based point-cloud regression) to turn one RGB-D frame + CAD mesh into coarse 6-DoF poses.
+- **[`src/foundationpose.py`](./src/foundationpose.py)** — `FoundationPoseRefiner` class. Wraps [FoundationPose](https://github.com/NVlabs/FoundationPose) to refine SAM-6D's coarse poses via iterative render-and-compare (`register()`, run once per object), then track them on every subsequent frame without re-running detection (`track()`).
+
+```mermaid
+flowchart TD
+    subgraph OB["Onboarding — once per CAD object, before the first frame"]
+        direction LR
+        CAD["CAD mesh"] --> BP["BlenderProc<br/>42 template views<br/>rgb / mask / xyz"]
+        BP --> ISMT["ISM template descriptors<br/>DINOv2 CLS + patch tokens"]
+        BP --> PEMT["PEM template features<br/>get_obj_feats()"]
+    end
+
+    CAM["<b>01 · Input</b><br/>RGB-D camera frame<br/>rgb [H,W,3] · depth [H,W] · K [3,3]"]
+
+    subgraph S6D["<b>02 · SAM-6D</b> — src/sam6d.py : SAM6D.forward()"]
+        direction LR
+        ISM["<b>ISM</b><br/>propose → clean → describe<br/>→ score → filter"] -->|"masks, boxes,<br/>best_template_ids"| PEM["<b>PEM</b><br/>crop → match → regress → suppress"]
+    end
+
+    subgraph FP["<b>03 · FoundationPose</b> — src/foundationpose.py : FoundationPoseRefiner"]
+        direction LR
+        REG["<b>register()</b><br/>frame 1: seed 252-pose grid<br/>→ refine → score → select"] -.->|"next frame"| TRK["<b>track()</b><br/>frame 2+: reuse estimator<br/>→ refine only"]
+    end
+
+    OUT["<b>04 · Output</b><br/>per-object pose stream<br/>4×4 (R | t, meters) · fp_score"]
+
+    ISMT -.cached, loaded at init.-> ISM
+    PEMT -.cached, loaded at init.-> PEM
+    CAM ==>|"rgb, depth, K"| ISM
+    PEM ==>|"poses, masks, boxes,<br/>pose_scores"| REG
+    CAM -.->|"rgb, depth, K"| REG
+    TRK ==> OUT
+    REG ==> OUT
+```
+*(solid arrows = per-frame data; dashed = precomputed once / alternate frame path)*
+
+**SAM-6D — ISM (instance segmentation)**: SAM proposes N masks → drop small disconnected blobs → DINOv2 embeds each proposal (CLS + masked-patch tokens) → score = semantic (CLS cosine vs. templates) + appearance (patch similarity) + geometric (IoU of the projected template point cloud vs. the box, using depth + K) → keep where `ism_score > det_score_thresh`.
+
+**SAM-6D — PEM (pose estimation)**: per kept proposal, crop RGB + sample a masked-depth point cloud → transformer matches it against the cached template point-cloud features → regresses `pred_R`, `pred_t`, and a pose confidence → drop overlapping detections (`mask_overlap_thresh`) and low-confidence poses (`pose_score_thresh`).
+
+**FoundationPose — `register()`** (frame 1 per object): build a 252-pose rotation hypothesis grid around the SAM-6D detection → iteratively re-render and correct each hypothesis (`PoseRefinePredictor`, `est_refine_iter` passes) → rank all of them with `ScorePredictor` → keep the best as the registered 4×4 pose.
+
+**FoundationPose — `track()`** (every frame after): reuses the stored estimator for each registered object — SAM-6D is not called again — and only re-renders/corrects from the previous pose (`track_refine_iter` passes, fewer than `register()`, so it's cheap enough to run every frame). `reset()` clears stored estimators before a new scene or object.
+
+See [`sam6d_example.ipynb`](./sam6d_example.ipynb) for a full worked example: camera intrinsics → `SAM6D` → `FoundationPoseRefiner` → pose visualization.
+
+Prerequisites specific to this pipeline (in addition to the CNOS install below):
+- `SAM-6D-main/` and `FoundationPose-main/` are vendored alongside `src/`; model weights auto-download on first use.
+- Build FoundationPose's `mycpp` C++ extension before using `FoundationPoseRefiner`:
+  ```
+  cd FoundationPose-main/mycpp && mkdir -p build && cd build \
+    && cmake .. -DPYTHON_EXECUTABLE=$(which python) && make -j4
+  ```
+  (or `bash FoundationPose-main/build_all_conda.sh`)
+- FoundationPose requires CUDA — there is no CPU fallback.
+
+The original CNOS + BOP benchmark evaluation harness (`run_inference.py`, `src/cnos.py`) is also still here, documented below under "Testing on BOP datasets" — it's a separate, detection-only offline evaluation path and does not feed the live pipeline above.
+
 ## Updates:
 - 23/05/2024: Added [tutorial](https://github.com/nv-nguyen/cnos?tab=readme-ov-file#testing-on-bop-datasets-rocket) to run CNOS on [HOPE dataset](https://bop.felk.cvut.cz/datasets/) for [BOP challenge 2024](https://bop.felk.cvut.cz/challenges/bop-challenge-2024/).
 - 23/07/2023: Added [tutorial](https://github.com/nv-nguyen/cnos#testing-on-custom-datasets-rocket) to run CNOS on custom datasets
