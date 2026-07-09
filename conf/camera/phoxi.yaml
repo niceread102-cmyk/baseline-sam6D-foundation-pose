@@ -1,0 +1,20 @@
+# Photoneo PhoXi 3D structured-light scanner (src/binpick/camera_phoxi.py — PhoXiCamera)
+_target_: src.binpick.camera_phoxi.PhoXiCamera
+
+# device_id: null -> auto-select the first discovered PhoXi3DScan device.
+# Set explicitly (see PhoXiControl's device list) if more than one scanner is present.
+device_id: null
+
+# address: only needed for a direct connection if network discovery doesn't find the
+# scanner (PhoXi Control -> Tools -> Add Device via Address).
+address: null
+
+# Extrinsic calibration: 4×4 transform from camera frame to robot-base frame.
+# This scanner is rigidly mounted in the workspace (NOT on the arm), so unlike
+# arm.T_cam_ee this is used directly — there is no per-capture FK recompute.
+# Generate with:  python scripts/calibrate_T_cam_base_phoxi.py
+T_cam_base:
+  - [-0.04913197, -0.99878788, -0.00297127, 0.28470342]
+  - [-0.97981204, 0.04762090, 0.19416647, -0.28022688]
+  - [-0.19378962, 0.01245107, -0.98096409, 0.78542722]
+  - [0.00000000, 0.00000000, 0.00000000, 1.00000000]

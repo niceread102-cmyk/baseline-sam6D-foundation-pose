@@ -31,10 +31,10 @@ cad_models:
 # ── Arm positions and calibration ─────────────────────────────────────────────
 arm:
   # Joint angles (radians) for the safe home / starting position
-  start_angles: [0.0, 0.7, 1.57, 0.0, 0.87, 0.0]
+  start_angles: [1.0, 0.0, 1.57, 0.0, 1.57, 1.0]
 
   # Cartesian hover position above the pick region (metres, robot-base frame)
-  hover_position: [0.3, 0.0, 0.44]
+  hover_position: [1.0, 0.0, 1.57, 0.0, 1.57, 1.0]
 
   # Target placement position (metres, robot-base frame)
   placement_position: [0.35, 0.20, 0.20]
