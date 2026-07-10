@@ -137,6 +137,21 @@ def preview_and_capture(cam, preview_dir: Path):
     return rgb, depth_mm, K
 
 
+def park_at_start(arm, config_path: Path) -> None:
+    """Move the arm to arm.start_angles, clear of the fixed PhoXi's view."""
+    import yaml
+    start_angles = np.array(yaml.safe_load(config_path.read_text())["arm"]["start_angles"],
+                            dtype=float).tolist()
+    print(f"  Target joint angles: {start_angles}")
+    # Manual dragging (STEP 1) can leave the controller in an error/warn state or
+    # out of position-control mode; set_servo_angle then no-ops without raising.
+    arm.clean_error(); arm.clean_warn(); arm.set_mode(0); arm.set_state(0)
+    code = arm.set_servo_angle(angle=start_angles, is_radian=True, speed=0.3, mvacc=5.0, wait=True)
+    if code not in (0, None):
+        raise RuntimeError(f"set_servo_angle failed (code={code})")
+    time.sleep(0.5)  # let the arm settle
+
+
 # ── Config update (camera.T_cam_base is top-level/flat, unlike arm.T_cam_ee) ──
 
 def format_T_cam_base_yaml(T: np.ndarray) -> str:
@@ -221,6 +236,13 @@ def main() -> None:
     arm = shared.connect_arm(args.robot_ip)
 
     try:
+        # ── STEP 0: Park clear of camera, preview marker placement ───────────
+        print(f"\n{'='*60}")
+        print("STEP 0: Parking arm at arm.start_angles, previewing PhoXi frame")
+        print(f"{'='*60}")
+        park_at_start(arm, args.config)
+        preview_and_capture(cam, preview_dir)
+
         # ── STEP 1: Touch each marker ──────────────────────────────────────────
         touch_points = shared.collect_touch_points(arm, args.markers)
         print(f"\nCollected {len(touch_points)} touch points: markers {sorted(touch_points.keys())}")
@@ -229,21 +251,11 @@ def main() -> None:
             print("ERROR: Need at least 3 touch points. Exiting.")
             return
 
-        # ── STEP 2: Park the arm clear of the fixed camera's view ────────────
-        import yaml
-        cfg = yaml.safe_load(args.config.read_text())
-        start_angles = np.array(cfg["arm"]["start_angles"], dtype=float)
+        # ── STEP 2: Re-park the arm clear of the fixed camera's view ─────────
         print(f"\n{'='*60}")
         print("STEP 2: Parking arm at arm.start_angles (clear of camera view)")
-        print(f"  Target joint angles: {start_angles.tolist()}")
         print(f"{'='*60}")
-        code = arm.set_servo_angle(angle=start_angles.tolist(), is_radian=True,
-                                   speed=0.3, mvacc=5.0, wait=True)
-        if isinstance(code, tuple):
-            code = code[0]
-        if code not in (0, None):
-            raise RuntimeError(f"set_servo_angle failed (code={code})")
-        time.sleep(0.5)  # let the arm settle
+        park_at_start(arm, args.config)
 
         # ── STEP 3: Capture PhoXi frame + detect markers ──────────────────────
         print(f"\n{'='*60}")
