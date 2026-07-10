@@ -1,0 +1,17 @@
+{
+  "steering_knuckle": [
+    {
+      "t_m": [
+        -0.01,
+        0.005,
+        0.0125
+      ],
+      "approach_azimuth_deg": 0,
+      "approach_elevation_deg": 0,
+      "jaw_roll_deg": 90,
+      "jaw_width_m": 0.025,
+      "jaw_length_m": 0.01,
+      "hover_dist_m": -0.06
+    }
+  ]
+}
