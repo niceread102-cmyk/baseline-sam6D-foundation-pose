@@ -32,11 +32,13 @@ Usage examples
   python scripts/calibrate_T_cam_base_phoxi.py --generate
 
   # Run calibration
-  python scripts/calibrate_T_cam_base_phoxi.py
+  # --tcp-offset is required — measure it from your end-effector's geometry
+  # (flange -> physical tip that touches the markers), mm/deg.
+  python scripts/calibrate_T_cam_base_phoxi.py --tcp-offset 0 0 80 0 0 0
 
   # Fewer markers, explicit PhoXi device / robot IP
-  python scripts/calibrate_T_cam_base_phoxi.py --markers 4 --device-id 2019-11-011-LC3 \\
-      --robot-ip 192.168.1.150
+  python scripts/calibrate_T_cam_base_phoxi.py --tcp-offset 0 0 80 0 0 0 \\
+      --markers 4 --device-id 2019-11-011-LC3 --robot-ip 192.168.1.150
 
   # Skip arm connection for camera-only dry-run (see what markers are visible)
   python scripts/calibrate_T_cam_base_phoxi.py --dry-run
@@ -188,6 +190,20 @@ def parse_args() -> argparse.Namespace:
                    help="Number of markers to use (default: 6, min: 3).")
     p.add_argument("--robot-ip", default="192.168.1.150",
                    help="xArm IP address (default: 192.168.1.150).")
+    p.add_argument("--tcp-offset", type=float, nargs=6, default=None,
+                   metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+                   help="Required. TCP offset from the flange to the physical point that "
+                        "touches markers (mm for X/Y/Z, degrees for ROLL/PITCH/YAW), measured "
+                        "from your end-effector's geometry. get_position() reports this exact "
+                        "point, so a wrong/unset value silently corrupts every touch point. "
+                        "Pass 0 0 0 0 0 0 to explicitly calibrate in the flange frame.")
+    p.add_argument("--expected-touch-z", type=float, default=0.0, metavar="Z_M",
+                   help="Expected touch-point Z in robot-base metres (default 0.0 — the PhoXi "
+                        "is fixed-mounted and the arm base is flush with the table the markers "
+                        "sit on). Warns when the mean recorded touch Z deviates by more than "
+                        "--touch-z-tol; raise --touch-z-tol to silence it if your setup differs.")
+    p.add_argument("--touch-z-tol", type=float, default=0.02, metavar="M",
+                   help="Tolerance in metres for the --expected-touch-z check (default 0.02).")
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                    help=f"Top-level config, used to read arm.start_angles — the arm is "
                         f"parked there before capture so it doesn't occlude the fixed "
@@ -233,7 +249,7 @@ def main() -> None:
         return
 
     # ── Connect to arm ─────────────────────────────────────────────────────────
-    arm = shared.connect_arm(args.robot_ip)
+    arm = shared.connect_arm(args.robot_ip, tcp_offset=args.tcp_offset)
 
     try:
         # ── STEP 0: Park clear of camera, preview marker placement ───────────
@@ -246,6 +262,7 @@ def main() -> None:
         # ── STEP 1: Touch each marker ──────────────────────────────────────────
         touch_points = shared.collect_touch_points(arm, args.markers)
         print(f"\nCollected {len(touch_points)} touch points: markers {sorted(touch_points.keys())}")
+        shared.check_touch_height(touch_points, args.expected_touch_z, args.touch_z_tol)
 
         if len(touch_points) < 3:
             print("ERROR: Need at least 3 touch points. Exiting.")

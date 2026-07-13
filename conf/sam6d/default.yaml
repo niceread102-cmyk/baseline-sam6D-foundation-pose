@@ -1,5 +1,8 @@
 # SAM6D configuration (src/sam6d.py — SAM6D class)
 # cad_path and model_ids are injected by BinPicker from cfg.cad_models.
+# physical_scale is injected by BinPicker from cfg.foundationpose.physical_scale —
+# the single authoritative value shared with FoundationPose (do not add a separate
+# sam6d.physical_scale key here; that would let the two values drift apart again).
 _target_: src.sam6d.SAM6D
 
 # Segmentation backbone: "vit_h" (2.4 GB, best), "vit_l" / "vit_b" (358 MB, faster)

@@ -66,6 +66,14 @@ class SAM6D:
         model_ids: Optional[List[str]] = None,
         device: str = "cuda",
 
+        # CAD-to-real-object scale correction. Mesh sampling below always does a
+        # raw mm->m conversion (/1000.0); physical_scale is an *additional* multiplier
+        # on top of that for when the CAD model is a different physical size than the
+        # real part (default 1.0 = no correction). Must match FoundationPoseRefiner's
+        # physical_scale for the same CAD model — see conf/foundationpose/default.yaml,
+        # the single authoritative source (injected by BinPicker into both classes).
+        physical_scale: float = 1.0,
+
         # Segmentor
         sam_checkpoint: Optional[Union[str, Path]] = None,
         sam_model_type: str = "vit_h",
@@ -132,6 +140,7 @@ class SAM6D:
         if len(self._model_ids) != M:
             raise ValueError(f"model_ids length {len(self._model_ids)} != cad_path count {M}")
         self.M = M
+        self._physical_scale = float(physical_scale)
 
         # --- Derive per-model template directories ---
         if template_dirs is not None:
@@ -603,13 +612,13 @@ class SAM6D:
 
         # ISM point cloud: sampled from CAD mesh, centred to match renderer
         mesh = trimesh.load_mesh(str(cad_path))
-        ism_pts = mesh.sample(2048).astype(np.float32) / 1000.0
-        mesh_centroid = np.array(mesh.bounding_box.centroid, dtype=np.float32) / 1000.0
+        ism_pts = mesh.sample(2048).astype(np.float32) / 1000.0 * self._physical_scale
+        mesh_centroid = np.array(mesh.bounding_box.centroid, dtype=np.float32) / 1000.0 * self._physical_scale
         ism_pts = ism_pts - mesh_centroid
         pointcloud = torch.tensor(ism_pts).unsqueeze(0).to(self.device)  # [1, 2048, 3]
 
         # PEM model points cached here to avoid per-frame mesh loading in forward()
-        pem_model_pts = mesh.sample(self.pem_n_sample_model).astype(np.float32) / 1000.0
+        pem_model_pts = mesh.sample(self.pem_n_sample_model).astype(np.float32) / 1000.0 * self._physical_scale
 
         logging.info(
             f"ISM ref data for {cad_path.stem}: "
@@ -631,7 +640,7 @@ class SAM6D:
     def _get_pem_template_from(self, tmpl_dir: Path, idx: int):
         """Load one rendered view for PEM from an explicit template directory."""
         rgb_np = np.array(Image.open(tmpl_dir / f"rgb_{idx}.png").convert("RGB"))
-        xyz = np.load(str(tmpl_dir / f"xyz_{idx}.npy")).astype(np.float32) / 1000.0
+        xyz = np.load(str(tmpl_dir / f"xyz_{idx}.npy")).astype(np.float32) / 1000.0 * self._physical_scale
         mask = (np.array(Image.open(tmpl_dir / f"mask_{idx}.png").convert("L")) == 255)
 
         rows = np.any(mask, axis=1)

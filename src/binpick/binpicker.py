@@ -81,7 +81,8 @@ class BinPicker:
 
         log.info("Loading SAM6D...")
         self.sam6d = hydra.utils.instantiate(
-            cfg.sam6d, cad_path=cad_paths, model_ids=model_ids
+            cfg.sam6d, cad_path=cad_paths, model_ids=model_ids,
+            physical_scale=float(cfg.foundationpose.physical_scale),
         )
 
         log.info("Loading FoundationPose...")

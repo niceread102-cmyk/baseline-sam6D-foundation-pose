@@ -25,10 +25,13 @@ Usage examples
   python scripts/calibrate_T_cam_base.py --generate
 
   # Run calibration (hover auto-read from arm.hover_position in conf/config.yaml)
-  python scripts/calibrate_T_cam_base.py
+  # --tcp-offset is required — measure it from your end-effector's geometry
+  # (flange -> physical tip that touches the markers), mm/deg.
+  python scripts/calibrate_T_cam_base.py --tcp-offset 0 0 80 0 0 0
 
   # Fewer markers, custom hover
-  python scripts/calibrate_T_cam_base.py --markers 4 --hover 0.30 0.0 0.50
+  python scripts/calibrate_T_cam_base.py --tcp-offset 0 0 80 0 0 0 \\
+      --markers 4 --hover 0.30 0.0 0.50
 
   # Skip arm connection for camera-only dry-run (see what markers are visible)
   python scripts/calibrate_T_cam_base.py --dry-run
@@ -290,6 +293,33 @@ def residuals_mm(T: np.ndarray, src_pts: np.ndarray, dst_pts: np.ndarray) -> np.
     return np.array(errs)
 
 
+def check_touch_height(
+    touch_points: dict[int, np.ndarray], expected_z: float | None, tol: float = 0.02
+) -> None:
+    """Warn if the mean touch-point Z is far from a known reference height.
+
+    The existing per-marker spread check only catches touch points that are
+    INCONSISTENT with each other — a wrong/unset TCP offset instead produces a
+    roughly CONSTANT bias (the flange-to-tip distance) across every marker, so
+    the spread check passes while every point is off by the same amount. This
+    catches that case by comparing against an absolute reference (e.g. 0 for a
+    flat table the arm is mounted flush with).
+    """
+    if expected_z is None or not touch_points:
+        return
+    z_vals = np.array([p[2] for p in touch_points.values()])
+    mean_z = float(z_vals.mean())
+    dz = mean_z - expected_z
+    print(f"Touch-point mean Z vs expected: {mean_z*1000:.1f} mm vs {expected_z*1000:.1f} mm "
+          f"(Δ={dz*1000:+.1f} mm)")
+    if abs(dz) > tol:
+        print(f"  WARNING: mean touch Z is {dz*1000:+.1f} mm from the expected "
+              f"{expected_z*1000:.1f} mm.")
+        print(f"  This usually means --tcp-offset doesn't match the physical end-effector "
+              f"(get_position() is reporting the wrong point) — check it before trusting "
+              f"this calibration.")
+
+
 # ── Config update ─────────────────────────────────────────────────────────────
 
 def format_T_for_yaml(T: np.ndarray, key: str = "T_cam_ee") -> str:
@@ -334,6 +364,19 @@ def parse_args() -> argparse.Namespace:
                         "and runtime FK cancel exactly.  MUST match arm.hover_position in config.")
     p.add_argument("--robot-ip", default="192.168.1.150",
                    help="xArm IP address (default: 192.168.1.150).")
+    p.add_argument("--tcp-offset", type=float, nargs=6, default=None,
+                   metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+                   help="Required. TCP offset from the flange to the physical point that "
+                        "touches markers (mm for X/Y/Z, degrees for ROLL/PITCH/YAW), measured "
+                        "from your end-effector's geometry. get_position() reports this exact "
+                        "point, so a wrong/unset value silently corrupts every touch point. "
+                        "Pass 0 0 0 0 0 0 to explicitly calibrate in the flange frame.")
+    p.add_argument("--expected-touch-z", type=float, default=None, metavar="Z_M",
+                   help="Expected touch-point Z in robot-base metres (e.g. 0.0 if the arm is "
+                        "mounted flush with the table the markers sit on). If given, warns when "
+                        "the mean recorded touch Z deviates by more than --touch-z-tol.")
+    p.add_argument("--touch-z-tol", type=float, default=0.02, metavar="M",
+                   help="Tolerance in metres for the --expected-touch-z check (default 0.02).")
     p.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
                    help=f"Config YAML to update (default: {DEFAULT_CONFIG}).")
     p.add_argument("--marker-dir", type=Path,
@@ -342,7 +385,19 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def connect_arm(robot_ip: str):
+def connect_arm(robot_ip: str, tcp_offset: list[float] | None = None):
+    """Connect to the xArm and set its TCP offset before any position is read.
+
+    get_position() reports the SDK's get_tcp_pose(), i.e. whichever physical
+    point the controller's currently-configured TCP offset defines — not a
+    fixed flange position. If that offset doesn't match the real end-effector
+    (or is left at its previous/default value), every "touch" point recorded
+    downstream is silently shifted by the flange-to-tip distance. tcp_offset
+    is therefore required here rather than left to whatever the controller
+    already has stored: pass the measured [x, y, z, roll, pitch, yaw] (mm,
+    deg) from the flange to the physical point that will touch markers/
+    objects, or [0, 0, 0, 0, 0, 0] to explicitly calibrate in the flange frame.
+    """
     from xarm import XArmAPI
     print(f"Connecting to xArm at {robot_ip}...")
     arm = XArmAPI(port=robot_ip, is_radian=True)
@@ -355,6 +410,31 @@ def connect_arm(robot_ip: str):
     arm.set_mode(0)
     arm.set_state(0)
     print("  Connected.")
+
+    time.sleep(0.3)  # let the real-time report stream populate tcp_offset
+    stored = arm.tcp_offset
+    stored_mm_deg = [round(v, 3) for v in list(stored[:3]) + list(np.degrees(stored[3:6]))]
+    print(f"  Controller-stored TCP offset (before this run): {stored_mm_deg}  "
+          f"[x,y,z mm, roll,pitch,yaw deg]")
+
+    if tcp_offset is None:
+        raise RuntimeError(
+            "No --tcp-offset given. get_position() reports whatever point the TCP "
+            "offset defines, so an unset/wrong offset silently corrupts every touch "
+            "point recorded during calibration. Pass --tcp-offset X Y Z ROLL PITCH YAW "
+            "(mm, deg) measured from the flange to the physical point that touches "
+            "markers/objects, or --tcp-offset 0 0 0 0 0 0 to explicitly confirm "
+            f"flange-referenced calibration. (Currently stored: {stored_mm_deg})"
+        )
+
+    code = arm.set_tcp_offset(list(tcp_offset), is_radian=False, wait=True)
+    if isinstance(code, tuple):
+        code = code[0]
+    if code not in (0, None):
+        raise RuntimeError(f"set_tcp_offset failed (code={code})")
+    print(f"  TCP offset set to: {list(tcp_offset)}  [x,y,z mm, roll,pitch,yaw deg] "
+          f"— get_position() now reports this point.")
+
     return arm
 
 
@@ -591,12 +671,13 @@ def main() -> None:
         return
 
     # ── Connect to arm ────────────────────────────────────────────────────────
-    arm = connect_arm(args.robot_ip)
+    arm = connect_arm(args.robot_ip, tcp_offset=args.tcp_offset)
 
     try:
         # ── STEP 1: Touch each marker ─────────────────────────────────────────
         touch_points = collect_touch_points(arm, args.markers)
         print(f"\nCollected {len(touch_points)} touch points: markers {sorted(touch_points.keys())}")
+        check_touch_height(touch_points, args.expected_touch_z, args.touch_z_tol)
 
         if len(touch_points) < 3:
             print("ERROR: Need at least 3 touch points. Exiting.")
