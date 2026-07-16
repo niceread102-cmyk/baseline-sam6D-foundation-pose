@@ -26,6 +26,22 @@ CAD_MODELS = [
     # {"path": "/home/joon/models/part_b.obj", "id": "part_b"},
 ]
 
+# Camera and grip planner — None uses the defaults in conf/config.yaml
+# (camera: phoxi — fixed-mount scanner with a static T_cam_base;
+#  grip_planner: manual — hand-authored 6-DOF grasps, see GRASPS_JSON_PATH below).
+# Override here for a quick swap without editing conf/config.yaml, e.g.
+# CAMERA = "realsense" for the eye-on-hand wrist camera, or
+# GRIP_PLANNER = "simple" for PCA-based centroid grips.
+CAMERA       = None   # e.g. "realsense"
+GRIP_PLANNER = None   # e.g. "simple"
+
+# Path to hand-authored 6-DOF grasps (grip_planner: manual only). Each grasp
+# defines a grip point + full approach orientation + hover backoff, per model
+# id — see the "Manual 6DoF grasp definition" section of
+# photo_neo_capture_test.ipynb for how to author/preview these before saving.
+# Set to None to use conf/grip_planner/manual.yaml's default (grasps/manual_grasps.json).
+GRASPS_JSON_PATH = None   # e.g. "/home/joon/Projects/cnos/grasps/manual_grasps.json"
+
 # Arm positions in metres (robot-base frame, X forward, Y left, Z up)
 # Set to None to use the value from conf/config.yaml (recommended — keeps config as source of truth).
 HOVER_POSITION     = None   # e.g. [0.30, 0.0, 0.44]
@@ -75,6 +91,14 @@ _CONF_DIR = str(Path(__file__).resolve().parent / "conf")
 
 def build_overrides() -> list[str]:
     overrides = []
+
+    # Camera / grip planner config-group swaps
+    if CAMERA is not None:
+        overrides.append(f"camera={CAMERA}")
+    if GRIP_PLANNER is not None:
+        overrides.append(f"grip_planner={GRIP_PLANNER}")
+    if GRASPS_JSON_PATH is not None:
+        overrides.append(f"grip_planner.grasps_path={GRASPS_JSON_PATH}")
 
     # CAD models — if empty here, falls back to whatever is set in conf/config.yaml
     if CAD_MODELS:

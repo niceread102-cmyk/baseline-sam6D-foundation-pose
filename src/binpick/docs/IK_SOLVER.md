@@ -10,7 +10,7 @@ This document describes the mathematics behind `Lite6IKSolver` in [`src/binpick/
 |-------|--------|-------------|
 | **Base** | Arm mounting point | Z up, X forward |
 | **Joint i** | Joint i axis intersection | Z along rotation axis |
-| **End-effector (EE)** | Gripper midpoint | Defined by DH chain |
+| **End-effector (EE)** | Gripper tip | DH chain (6 joints) + a fixed tool offset (§12) — without the offset this is the bare wrist flange, not the tip |
 
 All FK outputs and IK targets are expressed in the **robot-base frame**.
 
@@ -137,6 +137,8 @@ The interpolation is in **joint space** (straight line in $\theta$), which does 
 | Hard joint-limit clamping | Solver can stall near limits even when a solution exists inside the workspace | Provide a better `theta_init` away from the limits |
 | Small-angle rotation error approximation | Inaccurate for large orientation mismatches | Ensure `theta_init` is close to the target configuration |
 | Convergence not guaranteed at workspace boundary | Returns `(None, False)` | Reachability should be pre-checked with `GripFeasibilityChecker` |
+| Wrist-branch ambiguity (joints 4-6) | **Mitigated as of §11** — the solver now always keeps the joint-space-nearest wrist branch. Shoulder/elbow (joints 1-3) redundancy and genuinely unreachable poses are still unmitigated. | See §11 |
+| Tool offset not auto-detected offline | `Lite6IKSolver` defaults to zero TCP offset (bare flange) unless something sets it | `XArmController` reads the real, controller-configured offset at connect time (§12); for offline/standalone use, call `set_tcp_offset()` explicitly if the FK/IK result needs to represent a real gripper tip |
 
 ---
 
@@ -150,3 +152,89 @@ The interpolation is in **joint space** (straight line in $\theta$), which does 
 | `threshold` | `1e-3` | Convergence tolerance (m + rad) |
 | `step_clip` | `0.1` | Per-element joint velocity clamp (rad) |
 | `target_rpy` | `[π, 0, 0]` | Fixed EE orientation (ZYX Euler, rad) |
+| `tcp_offset_xyz` | `[0, 0, 0]` | Flange→tool-tip translation (metres) — see §12. Normally left at the default and set at runtime from the connected arm, not configured statically here. |
+| `tcp_offset_rpy` | `[0, 0, 0]` | Flange→tool-tip rotation (ZYX Euler, rad) — see §12 |
+
+---
+
+## 11. Wrist-Flip Branch Correction
+
+The Lite 6's wrist (joints 4-6) is spherical — their axes intersect at a point — which means, for
+any shoulder/elbow configuration $(\theta_1, \theta_2, \theta_3)$, there are exactly two joint
+solutions that produce the *identical* EE pose:
+
+$$(\theta_4, \theta_5, \theta_6) \quad \text{and} \quad (\theta_4 + \pi,\; -\theta_5,\; \theta_6 + \pi)$$
+
+This was verified numerically (not just asserted): sampling 5000 random joint configurations
+across the full joint range and comparing `fk(theta)` against `fk(flip(theta))` gives position and
+orientation differences on the order of `1e-16` — an exact identity for this DH chain, not an
+approximation.
+
+**Why this matters**: the single-seed damped-pseudoinverse solve in `_solve_core` has no reason to
+prefer one branch over the other — it just follows the local gradient from `theta_init`. Near the
+$\theta_5 \approx 0$ crossing, a *small* orientation-target change can cross from one branch to the
+other, producing a joint solution that is technically valid (same EE pose) but requires a large,
+unnecessary swing in joints 4-6 relative to `theta_init` — even when the much-closer other branch
+achieves the exact same pose. This was the root cause of a real hardware incident: a ~20° tilt
+between a scan pose and a grasp pose's target orientation produced a >2 rad swing on two wrist
+joints, tripping `XArmController`'s `max_joint_delta` safety reject.
+
+**The fix** (`Lite6IKSolver._wrist_flip` / `_closer_branch`, wrapping `_solve_core` inside
+`_solve_inner`): after any successful solve, compute the flipped alternative and keep whichever is
+closer to `theta_init` (per-joint max-abs distance). Since the flip is a closed-form
+re-derivation — not a re-solve — this costs nothing extra on the common path, can only reduce or
+leave unchanged the joint delta from `theta_init`, and is applied unconditionally to every `solve()`
+and `solve_6dof()` call. If the primary seed fails to converge at all, `_solve_inner` retries once
+from the flipped seed before giving up.
+
+The flip is always joint-limit-safe: joints 4 and 6 have $\pm 6.28$ rad range (a $+\pi$ wrap always
+fits), and joint 5's magnitude is unchanged by negation, so it stays within $\pm 2.16$ rad whenever
+the input did.
+
+This mitigates the wrist-branch case specifically. It does **not** address shoulder/elbow
+(joints 1-3) redundancy, nor genuinely unreachable poses — those remain open limitations (see the
+table above).
+
+---
+
+## 12. TCP (Tool) Offset — Flange vs. Real Fingertip
+
+`_fk_full`'s DH chain (`_LITE6_JOINTS`) has exactly six links, ending at the 6th joint's own
+rotation — i.e. the bare wrist **flange**, not wherever the physical gripper's fingers actually are.
+Every `fk()`/`solve()`/`solve_6dof()` call computed the flange's pose unless something appends a
+final flange→tool-tip transform.
+
+**This was the root cause of a second real hardware collision** (after the wrist-branch and
+EE-frame-remap fixes above had already resolved two earlier ones). The xArm controller already had
+a TCP offset configured via `scripts/calibrate_T_cam_base.py --tcp-offset` (persisted on the
+controller itself, so `get_position()` correctly reports the true fingertip) — but `Lite6IKSolver`
+is a separate, from-scratch Python reimplementation of the kinematics with no knowledge of that
+controller-side setting. So every Cartesian target we ever commanded (`hover_xyz`, `pick_xyz`,
+`placement_position`, the scan `hover_position`) was positioning the **flange** there, meaning the
+**real fingertip ended up one tool-length further along the approach axis than intended** — for a
+grasp with only a 60mm hover backoff and a ~80mm tool length, the "hover" pose alone already put the
+real fingertip *past* the intended grasp point, before any "descent" even began.
+
+**Confirmed, not guessed**: `XArmController`'s own long-standing startup "FK check" log line
+(comparing `get_position()` against `Lite6IKSolver.fk()` at the same joint angles) had been showing
+a ~80mm discrepancy in *every single run's log*, consistently oriented along the flange's own local
+Z axis, across multiple different arm poses (79.3mm / 80.1mm / 81.1mm measured across three distinct
+configurations) — the signature of a fixed tool length, not noise or a DH bug elsewhere in the chain.
+
+**The fix**: `Lite6IKSolver.set_tcp_offset(xyz_m, rpy_rad)` sets a fixed final transform (stored as
+`self._tcp_T`, applied to `T` at the very end of `_fk_full`, after all six joints) representing
+flange→tool-tip. `XArmController.__init__` reads the arm's own configured `tcp_offset` property
+right after connecting (a brief sleep first, matching `calibrate_T_cam_base.py`'s own pattern, so
+the real-time report stream has populated it) and pushes it into the IK solver — so the two always
+agree, regardless of what the calibrated tool length actually is, without a second config value that
+could silently drift out of sync. The Jacobian math needed **no changes**: `joint_origins`/`z_axes`
+are captured before the tool transform is applied (they describe the joints themselves, unaffected
+by whatever is rigidly attached past them), and the standard revolute-joint Jacobian column
+`ẑᵢ × (pos − pᵢ)` is valid for *any* point rigidly attached to the end-effector — tool tip included —
+so simply changing what `pos` means (tool tip instead of flange) is sufficient; verified the
+wrist-flip identity (§11) also still holds exactly with a nonzero offset active.
+
+Defaults to no offset (`[0,0,0]`, i.e. bare flange) for backward compatibility and for
+offline/standalone use (e.g. `scripts/verify_ik_wrist_flip.py`) where there is no connected arm to
+read a real offset from — call `set_tcp_offset()` explicitly in that case if the result needs to
+represent a real gripper tip.

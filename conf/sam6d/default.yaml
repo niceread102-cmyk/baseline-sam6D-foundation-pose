@@ -11,21 +11,21 @@ stability_score_thresh: 0.97
 points_per_side: 32
 
 # DINOv2 + PEM matching thresholds
-det_score_thresh: 0.35       # combined ISM score minimum
-confidence_thresh: 0.25      # semantic similarity minimum
+det_score_thresh: 0.375       # combined ISM score minimum
+confidence_thresh: 0.38     # semantic similarity minimum
 n_template_view: 42          # number of BlenderProc template views to use
-pose_score_thresh: 0.3       # PEM confidence minimum
+pose_score_thresh: 0.375       # PEM confidence minimum
 min_component_area_ratio: 0.005
-mask_overlap_thresh: 0.9
+mask_overlap_thresh: 0.2
 geo_iou_thresh: 0.0
 
 # Template rendering
 template_dir: ./sam6d_templates
 reset_templates: false
-# mesh_color: null            # uncomment and set (R,G,B) for colorless meshes
-# flat_shading: true          # recommended for CAD/STL meshes
-# roughness: 0.9
-# light_energy: 1100
+mesh_color: [2,2,2]            # uncomment and set (R,G,B) for colorless meshes
+flat_shading: true          # recommended for CAD/STL meshes
+roughness: 0.9
+light_energy: 1100
 
 # Blender path (required on ARM64; ignored if BLENDER_PATH env var is set)
 # blender_path: /home/joon/blender/blender-arm64

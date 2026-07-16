@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 
+import cv2
 import numpy as np
 
 log = logging.getLogger(__name__)
@@ -35,10 +36,34 @@ class PhoXiCamera:
         Optional IP/hostname for a direct connection, forwarded to
         ``PhoXiControl.connect`` (needed if the scanner isn't discovered
         automatically).
+    T_cam_base:
+        Not used by this class — accepted so Hydra can instantiate
+        ``cfg.camera`` directly (conf/camera/phoxi.yaml keeps the static
+        extrinsic alongside the rest of the camera config). BinPicker reads
+        it itself via ``OmegaConf.select(cfg, "camera.T_cam_base")``.
+    width / height:
+        Working resolution frames are resized to (matches
+        ``photo_neo_capture_test.ipynb``). The PhoXi's native resolution is far
+        larger than SAM6D/FoundationPose expect; FoundationPose's per-hypothesis
+        crop/warp runs at full frame resolution before cropping to the object,
+        so an un-resized frame multiplies straight into a multi-GB CUDA
+        allocation. ``K`` is rescaled to match, otherwise every downstream 3D
+        unprojection (SAM-6D's point cloud, FoundationPose's render-based
+        registration) is wrong.
     """
 
-    def __init__(self, device_id: str | None = None, address: str | None = None):
+    def __init__(
+        self,
+        device_id: str | None = None,
+        address: str | None = None,
+        T_cam_base: list | None = None,
+        width: int = 640,
+        height: int = 480,
+    ):
         from phoxi_api import PhoXiControl, PhoXiDevice
+
+        self._width  = int(width)
+        self._height = int(height)
 
         self._phc = PhoXiControl()
 
@@ -75,6 +100,17 @@ class PhoXiCamera:
         rgb = np.stack([texture] * 3, axis=-1) if texture.ndim == 2 else texture
         t_max = float(rgb.max())
         rgb = (rgb / t_max * 255).clip(0, 255).astype(np.uint8) if t_max > 0 else rgb.astype(np.uint8)
+
+        # K was read at the scanner's native resolution; rescale it to match the
+        # resize below, otherwise every downstream 3D unprojection is wrong.
+        orig_h, orig_w = depth.shape[:2]
+        if (orig_w, orig_h) != (self._width, self._height):
+            rgb = cv2.resize(rgb, (self._width, self._height), interpolation=cv2.INTER_AREA)
+            depth = cv2.resize(depth, (self._width, self._height), interpolation=cv2.INTER_AREA)
+            sx, sy = self._width / orig_w, self._height / orig_h
+            K = K.copy()
+            K[0, 0] *= sx; K[0, 2] *= sx   # fx, cx
+            K[1, 1] *= sy; K[1, 2] *= sy   # fy, cy
 
         return rgb, depth, K
 

@@ -9,6 +9,13 @@ device_id: null
 # scanner (PhoXi Control -> Tools -> Add Device via Address).
 address: null
 
+# Captured frames are resized to width x height (and K rescaled to match) before
+# being handed to SAM6D/FoundationPose — the PhoXi's native resolution is far
+# larger and feeding it through un-resized causes multi-GB CUDA allocations in
+# FoundationPose's per-hypothesis crop/warp step.
+width:  640
+height: 480
+
 # Extrinsic calibration: 4×4 transform from camera frame to robot-base frame.
 # This scanner is rigidly mounted in the workspace (NOT on the arm), so unlike
 # arm.T_cam_ee this is used directly — there is no per-capture FK recompute.

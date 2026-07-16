@@ -177,6 +177,114 @@ def overlay_axes(
     return vis
 
 
+# ── Grasp overlay (mirrors photo_neo_capture_test.ipynb's grasp preview) ──────
+# Colours converted from the notebook's RGB tuples to BGR (this module draws on
+# a BGR-converted canvas, see _to_bgr) — kept as separate named colours since
+# they draw new concepts (jaw/hover) that overlay_axes doesn't have.
+_GRASP_AXIS_COLORS_BGR = {"X": (255, 50, 50), "Y": (50, 200, 50), "Z": (50, 50, 255)}
+_GRASP_COLOR_BGR    = (0, 220, 255)    # yellow     — exact grasp position
+_HOVER_COLOR_BGR    = (230, 60, 230)   # magenta    — hover position
+_JAW_COLOR_BGR      = (0, 150, 255)    # orange     — jaw fingers + opening extent
+_APPROACH_COLOR_BGR = (200, 200, 200)  # light gray — grasp→hover line
+
+
+def _transform_pts_local(pts_local: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """Nx3 points in a local frame -> the frame T maps into (T is local->target 4x4)."""
+    return (T[:3, :3] @ np.asarray(pts_local).T).T + T[:3, 3]
+
+
+def _project_pts(pts_local: np.ndarray, T_local_to_cam: np.ndarray, K: np.ndarray) -> np.ndarray:
+    """Nx3 local-frame points -> Nx2 pixel coords, via local->camera transform + intrinsics."""
+    pts_cam = _transform_pts_local(pts_local, T_local_to_cam)
+    px, _ = cv2.projectPoints(pts_cam, np.zeros(3), np.zeros(3), K.astype(np.float64), np.zeros(5))
+    return px[:, 0]
+
+
+def _jaw_segments_local(width_m: float, length_m: float) -> dict[str, np.ndarray]:
+    """Jaw fingers + opening-extent line segments, as point pairs in the grasp's
+    LOCAL frame (fingers at x=±width_m/2, extending from z=0 back along +Z)."""
+    w = width_m / 2
+    L = length_m
+    return {
+        "jaw_left":  np.array([[ w, 0, 0], [ w, 0, L]]),
+        "jaw_right": np.array([[-w, 0, 0], [-w, 0, L]]),
+        "opening":   np.array([[ w, 0, 0], [-w, 0, 0]]),
+    }
+
+
+def overlay_grasps(
+    rgb: np.ndarray,
+    fp_results: list[dict] | None,
+    grips_by_model: dict[str, list] | None,
+    K: np.ndarray,
+    axis_len_m: float = 0.03,
+) -> np.ndarray:
+    """Draw grasp annotations (axes, jaw fingers, hover line/dot) on a copy of rgb.
+
+    Mirrors ``photo_neo_capture_test.ipynb``'s grasp-preview cell exactly — same
+    axis/jaw/hover geometry, drawn in the grasp's own AUTHORING frame
+    (``GripCandidate.orientation_m`` as loaded: column 0 = jaw axis, column 2 =
+    approach axis; see ``grip_planner._grasp_rotation``). This is deliberately
+    NOT the robot-EE-remapped orientation used for IK
+    (``object_selector._grasp_to_ee_frame``) — the point of this overlay is a
+    visual sanity check of the grasp's geometry against the object as seen by
+    the camera (does the grasp point/approach line clear the real object?),
+    independent of how it later gets mapped to the arm's frame.
+
+    Only grips with ``orientation_m`` set (``ManualGripPlanner``) are drawn;
+    PCA-based ``SimpleGripPlanner`` grips have no defined jaw/approach
+    convention to draw this way and are skipped.
+    """
+    vis = rgb.copy()
+    if fp_results is None or grips_by_model is None:
+        return vis
+
+    K = np.asarray(K, dtype=float)
+    vis_bgr = _to_bgr(vis)
+
+    for result in fp_results:
+        model_id = result.get("model_id", "")
+        T_obj_cam = np.asarray(result["pose"])
+
+        for idx, grip in enumerate(grips_by_model.get(model_id, [])):
+            if grip.orientation_m is None:
+                continue
+
+            T_grasp_local = np.eye(4)
+            T_grasp_local[:3, :3] = grip.orientation_m
+            T_grasp_local[:3, 3]  = grip.position_m
+            T = (T_obj_cam @ T_grasp_local).astype(np.float64)
+
+            origin_cam = T[:3, 3]
+            if origin_cam[2] <= 0:
+                continue  # grasp origin is behind the camera — nothing meaningful to project
+
+            axis_pts = np.array([[0, 0, 0], [axis_len_m, 0, 0], [0, axis_len_m, 0], [0, 0, axis_len_m]])
+            origin, x_tip, y_tip, z_tip = _project_pts(axis_pts, T, K).astype(int)
+            for tip, label in ((x_tip, "X"), (y_tip, "Y"), (z_tip, "Z")):
+                color = _GRASP_AXIS_COLORS_BGR[label]
+                cv2.line(vis_bgr, tuple(origin), tuple(tip), color, 2, cv2.LINE_AA)
+                cv2.putText(vis_bgr, label, tuple(tip), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+            # jaw fingers + opening extent, at the grasp position
+            for seg_local in _jaw_segments_local(grip.width_m, grip.jaw_length_m).values():
+                p0, p1 = _project_pts(seg_local, T, K).astype(int)
+                cv2.line(vis_bgr, tuple(p0), tuple(p1), _JAW_COLOR_BGR, 2, cv2.LINE_AA)
+
+            # approach axis (grasp -> hover) + hover position
+            hover_pts = np.array([[0, 0, 0], [0, 0, grip.hover_offset_m]])
+            p0, p1 = _project_pts(hover_pts, T, K).astype(int)
+            cv2.line(vis_bgr, tuple(p0), tuple(p1), _APPROACH_COLOR_BGR, 1, cv2.LINE_AA)
+            cv2.circle(vis_bgr, tuple(p1), 5, _HOVER_COLOR_BGR, -1, cv2.LINE_AA)
+
+            # exact grasp position, drawn last so it sits on top of the axes/jaw lines
+            cv2.circle(vis_bgr, tuple(origin), 4, _GRASP_COLOR_BGR, -1, cv2.LINE_AA)
+            cv2.putText(vis_bgr, str(idx), tuple(origin + np.array([8, -8])),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+    return cv2.cvtColor(vis_bgr, cv2.COLOR_BGR2RGB)
+
+
 # ── LivePreview thread ─────────────────────────────────────────────────────────
 
 class LivePreview(threading.Thread):
@@ -346,7 +454,7 @@ class LivePreview(threading.Thread):
             lines += [
                 ("",                                   (0, 0, 0),    0.5, 1),
                 ("IK path: N/A",                       (120, 80, 80), 0.4, 1),
-                ("(calibrate arm.T_cam_ee first)",     (100, 60, 60), 0.38, 1),
+                ("(calibrate camera.T_cam_base / arm.T_cam_ee)", (100, 60, 60), 0.38, 1),
             ]
 
         y = 40

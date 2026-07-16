@@ -94,7 +94,28 @@ $$\mathbf{p}_{pick} = R_{obj} \cdot [0,0,0] + \mathbf{p}_{obj} = \mathbf{p}_{obj
 
 ---
 
-## 3. `GripFeasibilityChecker` — Two-Stage Validation
+## 3. `ManualGripPlanner` — Hand-Authored 6-DOF Grasps
+
+`ManualGripPlanner` loads grasps (position + full orientation + hover backoff) from a JSON file — see the "Manual 6DoF grasp definition" section of `photo_neo_capture_test.ipynb` for how these are authored/previewed, and `grasps/manual_grasps.json` for the on-disk format. `GripCandidate.orientation_m` is a 3×3 rotation in a fixed **authoring convention**: column 0 is the jaw/closing axis, column 2 is the approach axis (see `grip_planner._grasp_rotation`).
+
+### The EE-frame remap (`object_selector._grasp_to_ee_frame`)
+
+The authoring convention above is generic to however the grasp was drawn in the notebook — it is **not** the Lite 6's own physical EE-frame convention. The Lite 6's convention is fixed by hardware and confirmed by the validated top-down default (`Lite6IKSolver`'s `target_rpy=[π,0,0]`, whose Z column points straight down):
+
+- Column 2 (Z) is **always** the approach axis.
+- The physical jaw/closing axis is whichever column `gripper_closing_axis` names (Y for the Lite 6 — see `conf/object_selector/nearest.yaml`), **not** column 0.
+
+`NearestObjectSelector.select()` therefore remaps `R_obj @ grip.orientation_m` through `_grasp_to_ee_frame` before it's ever used as an IK target. **This step is not optional.** Skipping it (i.e. feeding the grasp's authoring-frame rotation straight to `solve_6dof`) points the robot's own X axis — not its physical closing axis — along the intended jaw direction, while the *actual* closing axis (Y) ends up wherever the grasp's incidental third column happens to point. The approach axis (Z) still comes out correct, so the arm descends from a plausible-looking direction, but the gripper is rolled ~90° around it — which is exactly what produced a real hardware incident (gripper approaching correctly but striking the object from an unintended side, jaw misaligned by 90°). Verified both analytically (see the function's docstring for the derivation) and numerically against the actual incident's logged geometry: the unremapped rotation gave a jaw-axis alignment dot product of ~0 (perpendicular!) against the intended grasp direction, while the remapped one gives 1.0.
+
+**`gripper_closing_axis=0` needs no remap** (the authoring convention already matches). **`=1`** swaps the jaw onto column 1 and recomputes column 0 as a cross product to keep a right-handed frame. **`=2` is invalid** for manual grasps — a parallel gripper's closing axis can't coincide with its approach axis (column 2) — and raises.
+
+### Live-preview visualization (`visualizer.overlay_grasps`)
+
+The live preview's FoundationPose panel also overlays each detection's grasp candidates — axes, jaw fingers, and the hover position/approach line — as a direct visual sanity check of the grasp geometry against the object as seen by the camera. This draws in the grasp's **authoring frame** (`GripCandidate.orientation_m` as loaded, unremapped), matching `photo_neo_capture_test.ipynb`'s own grasp-preview cell exactly — it is deliberately independent of the EE-frame remap above, since the point is to check "does this grasp point/approach line clear the real object," not to preview what the robot's own axes will do. `GripCandidate.jaw_length_m` (from the grasp JSON's `jaw_length_m`, default `0.01`) only affects this drawing — it is not a physical constraint used anywhere in planning.
+
+---
+
+## 4. `GripFeasibilityChecker` — Two-Stage Validation
 
 Feasibility is checked after FoundationPose gives the object's pose, so all checks happen in **robot-base frame**.
 
@@ -150,7 +171,7 @@ For the Lite 6 the default is `gripper_closing_axis=1` (Y-axis closes).
 
 ---
 
-## 4. Configuration
+## 5. Configuration
 
 ### `conf/grip_planner/simple.yaml`
 
@@ -163,6 +184,7 @@ For the Lite 6 the default is `gripper_closing_axis=1` (Y-axis closes).
 | `min_pick_height_m` | `0.02` | Height floor for check 1 |
 | `check_grip_orientation` | `true` | Enable/disable check 2 |
 | `gripper_closing_axis` | `1` | EE axis for gripper closing direction |
+| `max_joint_delta` | *(injected)* | Not set in this file — `BinPicker` injects it from `arm_controller.max_joint_delta` (the same value `XArmController` uses for its hardware safety reject), so a plan requiring too large a joint move from the arm's actual current/next position is rejected in `NearestObjectSelector.select()` before the gripper opens and a move is attempted. `0` (default when the active `arm_controller` config has no `max_joint_delta` field, e.g. `ros.yaml`) disables the check. |
 
 ### `conf/config.yaml`
 
@@ -173,11 +195,12 @@ For the Lite 6 the default is `gripper_closing_axis=1` (Y-axis closes).
 
 ---
 
-## 5. Limitations
+## 6. Limitations
 
 | Limitation | Impact | Workaround |
 |-----------|--------|-----------|
 | Centroid-as-pick-point | Fails for non-convex or multi-lobe objects | Override `GripCandidate.position_m` in a custom planner |
 | PCA gives symmetric grips | Both axis directions (±) could be tried; only one is used | Extend `SimpleGripPlanner` to generate candidates for both axis directions |
 | Gripper orientation check is approximate | `_build_target_R` assumes downward approach; may miss valid tilted approaches | Add more approach directions to the feasibility check |
-| No collision checking | Arm may collide with bin walls for feasible IK poses | Add workspace constraints to the feasibility checker |
+| No collision checking | Arm may collide with bin walls, or the object itself, for feasible IK poses | Add workspace constraints to the feasibility checker |
+| Correct orientation ≠ small joint delta | Fixing a grasp's orientation (e.g. the EE-frame remap above) can *increase* the joint travel needed vs. an incorrectly-oriented one that happened to be reachable with a smaller move — a single manual grasp may be kinematically far from the scan-hover pose for some detected object orientations, and get rejected by `max_joint_delta` more often than an (incorrect) unremapped grasp would have been | Author additional grasp variants (different `approach_azimuth_deg`/`approach_elevation_deg`/`jaw_roll_deg`) so the selector has a reachable fallback; or reconsider the scan-hover pose |

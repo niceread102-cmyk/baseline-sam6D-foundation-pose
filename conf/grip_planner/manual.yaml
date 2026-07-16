@@ -1,0 +1,11 @@
+# Manual 6-DOF grasp planner (src/binpick/grip_planner.py — ManualGripPlanner)
+# Loads hand-authored grasps (position + full orientation + hover backoff) from
+# a JSON file, in the format produced by the "Manual 6DoF grasp definition"
+# section of photo_neo_capture_test.ipynb.
+# cad_models, effective_scale, min_grip_m, max_grip_m injected by BinPicker.
+_target_: src.binpick.grip_planner.ManualGripPlanner
+
+# Path to the grasps JSON (model_id -> list of grasp dicts). Resolved relative
+# to the current working directory if not absolute — run from the repo root,
+# same convention as cad_models paths.
+grasps_path: grasps/manual_grasps.json

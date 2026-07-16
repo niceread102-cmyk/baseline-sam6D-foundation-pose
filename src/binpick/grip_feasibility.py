@@ -79,11 +79,21 @@ class GripFeasibilityChecker:
         pick_xyz: np.ndarray,
         approach_axis_base: np.ndarray,
         theta_init: np.ndarray,
+        target_R: np.ndarray | None = None,
     ) -> tuple[bool, str]:
         """Return (feasible, reason_string).
 
         Called AFTER the pose from FoundationPose has been applied so that
         pick_xyz and approach_axis_base are in robot-base frame.
+
+        Parameters
+        ----------
+        target_R:
+            Explicit target EE orientation (3×3, robot-base frame), used as-is
+            for the 6-DOF IK check. Pass this when the grip candidate already
+            defines a full orientation (``ManualGripPlanner``). If omitted, an
+            orientation is heuristically constructed from ``approach_axis_base``
+            via ``_build_target_R`` (legacy PCA-based grips).
         """
         pick_xyz = np.asarray(pick_xyz, dtype=float)
 
@@ -96,8 +106,8 @@ class GripFeasibilityChecker:
 
         # 2. 6-DOF orientation check
         if self._check_orient:
-            target_R = self._build_target_R(approach_axis_base)
-            _, ok = self._ik.solve_6dof(pick_xyz, target_R, theta_init)
+            R = target_R if target_R is not None else self._build_target_R(approach_axis_base)
+            _, ok = self._ik.solve_6dof(pick_xyz, R, theta_init)
             if not ok:
                 ax = approach_axis_base
                 return False, (

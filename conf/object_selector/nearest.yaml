@@ -1,5 +1,8 @@
 # Nearest-object selector (src/binpick/object_selector.py — NearestObjectSelector)
 # ik_solver, placement_position, T_cam_base injected by BinPicker.
+# max_joint_delta is ALSO injected by BinPicker, from arm_controller.max_joint_delta —
+# the same threshold XArmController uses for its hardware safety reject — so a plan
+# requiring too large a joint move is rejected here at planning time instead.
 _target_: src.binpick.object_selector.NearestObjectSelector
 
 # GripFeasibilityChecker settings (applied AFTER FoundationPose gives the object pose)

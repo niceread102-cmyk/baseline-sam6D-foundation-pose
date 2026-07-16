@@ -11,9 +11,9 @@ defaults:
   - foundationpose: default
   - ik: lite6
   - arm_controller: xarm
-  - grip_planner: simple
+  - grip_planner: manual
   - object_selector: nearest
-  - camera: realsense
+  - camera: phoxi
   - preview: default
   - _self_
 
@@ -26,7 +26,7 @@ defaults:
 
 cad_models:
   - path: /home/joon/Downloads/cad_files/steering_knuckle/steering-knuckle-thunder-truck-r1-r.stl
-    id: part_steering
+    id: steering_knuckle
 
 # ── Arm positions and calibration ─────────────────────────────────────────────
 arm:
@@ -34,7 +34,7 @@ arm:
   start_angles: [1.0, 0.0, 1.57, 0.0, 1.57, 1.0]
 
   # Cartesian hover position above the pick region (metres, robot-base frame)
-  hover_position: [1.0, 0.0, 1.57, 0.0, 1.57, 1.0]
+  hover_position: [0.1199, 0.1918, 0.3874]
 
   # Target placement position (metres, robot-base frame)
   placement_position: [0.35, 0.20, 0.20]

@@ -232,6 +232,8 @@ class Lite6IKSolver(IKSolver):
         threshold: float = 1e-3,
         step_clip: float = 0.1,
         target_rpy: list[float] | None = None,
+        tcp_offset_xyz: list[float] | None = None,
+        tcp_offset_rpy: list[float] | None = None,
     ):
         """
         Parameters
@@ -254,6 +256,24 @@ class Lite6IKSolver(IKSolver):
         target_rpy:
             Fixed EE orientation as ZYX Euler angles [r, p, y] (radians).
             Defaults to ``[π, 0, 0]`` (gripper pointing straight down).
+        tcp_offset_xyz / tcp_offset_rpy:
+            Fixed tool transform (metres / radians, ZYX Euler) applied AFTER
+            the 6th joint — i.e. flange → actual gripper-tip. Without this,
+            ``fk``/``solve``/``solve_6dof`` compute the bare wrist flange, not
+            the real fingertip, so every Cartesian target is silently reached
+            short (or, if the caller thinks in fingertip terms, the real
+            fingertip overshoots by the tool length along the approach axis —
+            this was the root cause of a real hardware collision, confirmed
+            by comparing this solver's ``fk()`` against the xArm SDK's own
+            ``get_position()`` at matching joint angles: a ~80mm discrepancy,
+            consistent in magnitude across multiple different arm poses,
+            aligned almost entirely with the flange's own local Z axis).
+            Defaults to no offset (``[0,0,0]``) for backward compatibility and
+            standalone/offline testing; ``XArmController`` sets this from the
+            connected arm's actual configured ``tcp_offset`` at startup, since
+            that (not a hardcoded config value) is ground truth for whatever
+            gripper is physically attached. Use ``set_tcp_offset()`` to update
+            after construction.
         """
         self._damping   = damping
         self._alpha     = alpha
@@ -261,6 +281,22 @@ class Lite6IKSolver(IKSolver):
         self._threshold = threshold
         self._step_clip = step_clip
         self._target_R  = _euler_R(*(target_rpy or [np.pi, 0.0, 0.0]))
+        self._tcp_T     = np.eye(4)
+        self.set_tcp_offset(tcp_offset_xyz, tcp_offset_rpy)
+
+    def set_tcp_offset(
+        self, xyz_m: list[float] | None = None, rpy_rad: list[float] | None = None
+    ) -> None:
+        """Set (or clear, with both args None) the flange→tool-tip transform.
+
+        Applied as a fixed final link after the 6th joint in ``_fk_full`` — see
+        the constructor docstring for why this exists and how its value was
+        derived. Safe to call any time after construction (e.g. once the real
+        arm's configured TCP offset is known, right after connecting).
+        """
+        xyz = xyz_m or [0.0, 0.0, 0.0]
+        rpy = rpy_rad or [0.0, 0.0, 0.0]
+        self._tcp_T = _make_T(xyz, rpy)
 
     # ── forward kinematics ────────────────────────────────────────────────
 
@@ -273,22 +309,27 @@ class Lite6IKSolver(IKSolver):
         1. A fixed offset transform ``_make_T(jnt.xyz, jnt.rpy)`` that positions
            the joint frame relative to the previous one.
         2. A variable rotation about the joint's Z-axis by ``theta[i]``.
+        Finally, the fixed flange→tool-tip transform (``self._tcp_T``, see
+        ``set_tcp_offset``) is applied — ``T_ee``/``pos``/``quat`` below are
+        the actual gripper tip, not the bare wrist flange.
 
         Returns
         -------
         T_ee:
-            4×4 EE pose in robot-base frame.
+            4×4 EE (tool-tip) pose in robot-base frame.
         pos:
-            EE position (metres), shape (3,).
+            EE (tool-tip) position (metres), shape (3,).
         quat:
-            EE quaternion [w, x, y, z], shape (4,).
+            EE (tool-tip) quaternion [w, x, y, z], shape (4,).
         z_axes:
             List of 6 unit vectors — the Z-axis of each joint frame in
             robot-base coordinates.  Used as the Jacobian rotation axes.
         joint_origins:
             List of 6 positions (metres) — the origin of each joint frame in
             robot-base coordinates.  Used to compute the moment arm for the
-            linear Jacobian columns.
+            linear Jacobian columns.  Unaffected by the tool transform — the
+            Jacobian's ``z_i × (pos - joint_origins[i])`` formula is valid for
+            any point rigidly attached to the end-effector, tool tip included.
         """
         z_axes, joint_origins = [], []
         T = np.eye(4)
@@ -297,6 +338,7 @@ class Lite6IKSolver(IKSolver):
             z_axes.append(T[:3, 2].copy())
             joint_origins.append(T[:3, 3].copy())
             T = T @ _make_T([0, 0, 0], [0, 0, theta[i]])
+        T = T @ self._tcp_T
         return T, T[:3, 3].copy(), _R_to_quat(T[:3, :3]), z_axes, joint_origins
 
     def fk(self, theta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -326,6 +368,65 @@ class Lite6IKSolver(IKSolver):
         return self._solve_inner(target_xyz, np.asarray(target_R, dtype=float), theta_init)
 
     def _solve_inner(
+        self,
+        target_xyz: np.ndarray,
+        target_R: np.ndarray,
+        theta_init: np.ndarray,
+    ) -> tuple[np.ndarray | None, bool]:
+        """Solve, then correct for the Lite 6's wrist-branch ambiguity.
+
+        The spherical wrist (joints 4-6) has two joint-space solutions for any
+        given EE orientation: ``(θ4, θ5, θ6)`` and ``(θ4+π, −θ5, θ6+π)`` are
+        exactly equivalent (see ``_wrist_flip``). A single-seed Jacobian solve
+        can land on either branch — usually the nearby one, but near the
+        θ5≈0 crossing it can jump to the far one even for a small orientation
+        change, producing a huge (but technically valid) joint delta from
+        ``theta_init``. Since the flip is a free, exact re-derivation (no
+        extra solve), always keep whichever branch is closer to ``theta_init``.
+        """
+        theta, ok = self._solve_core(target_xyz, target_R, theta_init)
+        if ok:
+            return self._closer_branch(theta, theta_init), True
+
+        # Primary seed failed to converge at all — retry once from the
+        # analytically-equivalent flipped seed before giving up.
+        theta2, ok2 = self._solve_core(target_xyz, target_R, self._wrist_flip(theta_init))
+        if ok2:
+            return self._closer_branch(theta2, theta_init), True
+        return None, False
+
+    @staticmethod
+    def _wrist_flip(theta: np.ndarray) -> np.ndarray:
+        """Analytically-equivalent alternate joint solution for the SAME EE pose.
+
+        Joints 4-6 form a spherical wrist (their axes intersect at a point):
+        for any θ1-3, ``FK(θ)`` and ``FK(θ with θ4+=π, θ5=−θ5, θ6+=π)`` are
+        identical — verified numerically to float precision across the full
+        joint range (random-sample FK-equivalence check; see
+        ``docs/IK_SOLVER.md`` §11). Always joint-limit-safe: joints 4 and 6
+        have ±6.28 rad range (a +π wrap always fits), and joint 5's magnitude
+        is unchanged by negation, so it stays within ±2.16 rad whenever the
+        input did.
+        """
+        flipped = theta.copy()
+        flipped[3] = np.arctan2(np.sin(flipped[3] + np.pi), np.cos(flipped[3] + np.pi))
+        flipped[4] = -flipped[4]
+        flipped[5] = np.arctan2(np.sin(flipped[5] + np.pi), np.cos(flipped[5] + np.pi))
+        return np.clip(flipped, _LITE6_JOINT_MIN, _LITE6_JOINT_MAX)
+
+    @staticmethod
+    def _closer_branch(theta: np.ndarray, theta_init: np.ndarray) -> np.ndarray:
+        """Return whichever of ``{theta, _wrist_flip(theta)}`` is nearer ``theta_init``.
+
+        Uses per-joint max-abs distance, matching ``XArmController``'s
+        per-joint ``max_joint_delta`` safety-gate semantics.
+        """
+        flipped = Lite6IKSolver._wrist_flip(theta)
+        d      = np.max(np.abs(theta - theta_init))
+        d_flip = np.max(np.abs(flipped - theta_init))
+        return flipped if d_flip < d else theta
+
+    def _solve_core(
         self,
         target_xyz: np.ndarray,
         target_R: np.ndarray,

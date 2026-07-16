@@ -23,15 +23,21 @@ The pick-and-place loop (``BinPicker.run()``)
 4. **Detect**  — SAM6D segments the scene; exit loop when nothing is found
 5. **Refine**  — FoundationPose refines 6-DOF poses from SAM6D masks
 6. **Plan**    — NearestObjectSelector picks the best object + grip
-7. **Execute** — open gripper → pick → close → place → open
+7. **Execute** — open gripper → approach hover (if defined) → pick → close →
+                 retreat to hover (if defined) → place → open
 8. **Recover** — on failure, return to home with ``safe=False``
 9. **Repeat**  — from step 2 until the bin is empty
 
 Coordinate and unit conventions
 --------------------------------
-- ``T_cam_ee``: fixed 4×4 transform from camera frame to EE frame (calibrated once).
-- ``T_cam_base``: recomputed every capture as ``fk_matrix(θ) @ T_cam_ee``.
-  Maps camera-frame points to robot-base frame: ``p_base = T_cam_base @ p_cam_hom``.
+- ``T_cam_base``: camera-frame → robot-base frame transform, i.e.
+  ``p_base = T_cam_base @ p_cam_hom``. Computed one of two ways depending on
+  the camera's mounting (see ``_compute_T_cam_base``):
+    - **Fixed-mount** (e.g. PhoXi): ``camera.T_cam_base`` is a static
+      extrinsic from config — the scanner doesn't move with the arm.
+    - **Eye-on-hand** (e.g. RealSense): ``T_cam_ee`` is a fixed camera→EE
+      transform (calibrated once), and ``T_cam_base = fk_matrix(θ) @ T_cam_ee``
+      is recomputed every capture.
 - FoundationPose pose matrices are in **camera frame**, translation in **metres**.
 - All arm positions are in **metres** (robot-base frame); joint angles in **radians**.
 - Depth from the camera is in **millimetres** (SAM6D / FoundationPose convention).
@@ -48,10 +54,11 @@ from omegaconf import DictConfig, OmegaConf
 
 from .arm_controller import ArmController
 from .camera import RealSenseCamera
+from .camera_phoxi import PhoXiCamera
 from .grip_planner import GripPlanner
 from .ik_solver import IKSolver
 from .object_selector import ObjectSelector, PickPlan
-from .visualizer import LivePreview, NullPreview, overlay_axes, overlay_masks
+from .visualizer import LivePreview, NullPreview, overlay_axes, overlay_grasps, overlay_masks
 
 log = logging.getLogger(__name__)
 
@@ -116,28 +123,45 @@ class BinPicker:
         )
 
         log.info("Setting up object selector...")
-        # T_cam_ee: fixed camera-to-EE transform (camera rigidly mounted on wrist).
-        # T_cam_base is recomputed every capture: T_cam_base = fk_matrix(θ) @ T_cam_ee
+        # T_cam_ee: fixed camera-to-EE transform (eye-on-hand, e.g. RealSense on
+        # the wrist). T_cam_base is recomputed every capture from this + FK.
         self._T_cam_ee: np.ndarray | None = (
             np.array(OmegaConf.to_container(cfg.arm.T_cam_ee, resolve=True))
             if cfg.arm.T_cam_ee is not None else None
         )
-        if self._T_cam_ee is None:
+        # camera.T_cam_base: static extrinsic for a fixed-mount camera (e.g.
+        # PhoXi, rigidly mounted in the workspace) — takes precedence over
+        # T_cam_ee since it needs no FK recompute. See _compute_T_cam_base.
+        camera_T_cam_base = OmegaConf.select(cfg, "camera.T_cam_base", default=None)
+        self._T_cam_base_fixed: np.ndarray | None = (
+            np.array(OmegaConf.to_container(camera_T_cam_base, resolve=True))
+            if camera_T_cam_base is not None else None
+        )
+        if self._T_cam_base_fixed is None and self._T_cam_ee is None:
             log.warning(
-                "arm.T_cam_ee is null — T_cam_base will not be computed. "
+                "Neither camera.T_cam_base (fixed-mount) nor arm.T_cam_ee "
+                "(eye-on-hand) is set — T_cam_base will not be computed. "
                 "Object poses will remain in camera frame (picks will fail). "
-                "Run scripts/calibrate_T_cam_base.py to generate T_cam_ee."
+                "Run scripts/calibrate_T_cam_base_phoxi.py or "
+                "scripts/calibrate_T_cam_base.py."
             )
 
+        # Shared safety threshold: same value the arm controller uses to hard-reject
+        # a move (conf/arm_controller/xarm.yaml), reused here so bad plans are
+        # rejected at planning time instead of only being caught after the gripper
+        # opens and a move is attempted. conf/arm_controller/ros.yaml has no such
+        # field, hence OmegaConf.select with a disabled (0.0) default.
+        max_joint_delta = float(OmegaConf.select(cfg, "arm_controller.max_joint_delta", default=0.0))
         self.selector: ObjectSelector = hydra.utils.instantiate(
             cfg.object_selector,
             ik_solver=self.ik,
             placement_position=list(cfg.arm.placement_position),
+            max_joint_delta=max_joint_delta,
             # T_cam_base is NOT passed here; it is injected per-call in run()
         )
 
         log.info("Setting up camera...")
-        self.camera: RealSenseCamera = hydra.utils.instantiate(cfg.camera)
+        self.camera: RealSenseCamera | PhoXiCamera = hydra.utils.instantiate(cfg.camera)
 
         # Pre-sample mesh point clouds for FP overlay (centred + scaled, object frame)
         self._mesh_pts: dict[str, np.ndarray] = {}
@@ -162,16 +186,35 @@ class BinPicker:
 
         self.cfg = cfg
 
+    # ── camera extrinsics ─────────────────────────────────────────────────
+
+    def _compute_T_cam_base(self, theta: np.ndarray) -> np.ndarray | None:
+        """Camera→base transform: static for a fixed-mount camera (PhoXi), or
+        recomputed via FK for an eye-on-hand camera (RealSense). Returns None
+        if neither ``camera.T_cam_base`` nor ``arm.T_cam_ee`` is configured.
+        """
+        if self._T_cam_base_fixed is not None:
+            return self._T_cam_base_fixed
+        if self._T_cam_ee is not None:
+            return self.ik.fk_matrix(theta) @ self._T_cam_ee
+        return None
+
     # ── execution helpers ─────────────────────────────────────────────────
 
     def _execute_pick(self, plan: PickPlan, n_detections: int) -> None:
-        """Open gripper, move to pick position, and close gripper.
+        """Open gripper, approach via the pre-grasp hover pose (if any), descend
+        to the pick position, close the gripper, then retreat back through hover.
 
-        Raises ``RuntimeError`` if either arm move fails so the caller can
-        trigger the recovery path.
+        Raises ``RuntimeError`` if any arm move fails so the caller can trigger
+        the recovery path.
         """
         self.preview.update_status("Opening gripper", gripper_open=True, n_detections=n_detections)
         self.arm.set_gripper(open=True)
+
+        if plan.theta_hover is not None:
+            self.preview.update_status("Approaching", gripper_open=True, n_detections=n_detections)
+            if not self.arm.move_to_angles(plan.theta_hover):
+                raise RuntimeError("Hover approach move failed — arm rejected angles or safety check triggered")
 
         self.preview.update_status("Moving to pick", gripper_open=True, n_detections=n_detections)
         if not self.arm.move_to_angles(plan.theta_pick):
@@ -180,6 +223,11 @@ class BinPicker:
         self.preview.update_status("Gripping", gripper_open=False, n_detections=n_detections)
         self.arm.set_gripper(open=False)
         time.sleep(_GRIP_SETTLE_S)
+
+        if plan.theta_hover is not None:
+            self.preview.update_status("Retreating", gripper_open=False, n_detections=n_detections)
+            if not self.arm.move_to_angles(plan.theta_hover):
+                raise RuntimeError("Retreat move failed — arm rejected angles or safety check triggered")
 
     def _execute_place(self, plan: PickPlan, n_detections: int) -> None:
         """Move to placement position and release the gripper.
@@ -283,10 +331,7 @@ class BinPicker:
         self.arm.move_to_xyz(hover_xyz)
         rgb0, depth0, K0 = self.camera.capture()
         hover_theta0 = self.arm.current_theta
-        T_cb0 = (
-            self.ik.fk_matrix(hover_theta0) @ self._T_cam_ee
-            if self._T_cam_ee is not None else None
-        )
+        T_cb0 = self._compute_T_cam_base(hover_theta0)
         if T_cb0 is not None:
             self._log_startup_diagnostics(T_cb0, depth0, K0, hover_xyz)
 
@@ -300,12 +345,10 @@ class BinPicker:
                 self.preview.update_status("Capturing", gripper_open=True, n_detections=0)
                 rgb, depth, K = self.camera.capture()
                 # depth is in mm (camera.depth_units == "mm")
-                # Recompute T_cam_base from current arm pose × fixed T_cam_ee
+                # Fixed-mount cameras get a static T_cam_base; eye-on-hand cameras
+                # get it recomputed from the current arm pose (see _compute_T_cam_base)
                 hover_theta = self.arm.current_theta
-                T_cam_base = (
-                    self.ik.fk_matrix(hover_theta) @ self._T_cam_ee
-                    if self._T_cam_ee is not None else None
-                )
+                T_cam_base = self._compute_T_cam_base(hover_theta)
                 self.preview.set_T_cam_base(T_cam_base)
                 self.preview.update_live(rgb, depth)
 
@@ -333,6 +376,7 @@ class BinPicker:
                 log.info("FoundationPose: %d refined pose(s)", len(fp_results))
 
                 fp_vis = overlay_axes(rgb, fp_results, K, self._mesh_pts)
+                fp_vis = overlay_grasps(fp_vis, fp_results, grips, K)
                 self.preview.update_fp_panel(fp_vis)
                 self.preview.update_status(
                     "Detected", gripper_open=True, n_detections=len(fp_results)

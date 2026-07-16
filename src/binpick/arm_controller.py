@@ -10,6 +10,20 @@ that logs the EE position every ``_POLL_INTERVAL_S`` seconds while the arm is
 in motion.  The move call blocks until the arm reports completion, then the
 thread is stopped before returning.
 
+Move verification
+------------------
+The xArm SDK's ``set_servo_angle(wait=True)`` returning success only means its
+internal ``wait_move()`` observed the motion *state* clear — not that the arm
+reached the commanded joints. A collision/torque-limit stop mid-move, or a
+race in ``wait_move()``'s state polling when two moves are issued back-to-back
+with no gap, can both report success while the arm silently stalls partway.
+``move_to_angles`` therefore reads back the actual joint angles after every
+``wait=True`` move and treats a mismatch beyond ``_POSITION_VERIFY_TOL_RAD`` as
+a failure — this is what catches a partial/aborted move *before* the caller
+(e.g. ``BinPicker._execute_pick``) proceeds to close the gripper on it. A
+``_MOVE_SETTLE_S`` pause after every confirmed move also guards against the
+back-to-back race itself.
+
 Unit conventions
 ----------------
 - Joint angles: **radians** (xArm SDK is initialised with ``is_radian=True``).
@@ -38,6 +52,16 @@ _RECOVERY_SETTLE_S  = 0.3    # wait after fault-clear before reseating commanded
 _RECOVERY_SPEED     = 0.05   # rad/s — very slow reseat move after fault recovery
 _RECOVERY_ACC       = 1.0    # rad/s²
 _XARM_MM_TO_M       = 1e-3   # xArm FK returns mm; multiply to get metres
+
+# Post-move verification: the xArm SDK's set_servo_angle(wait=True) can report
+# success (code=0) even when the arm never reached the commanded target — e.g.
+# a collision/torque-limit stop partway through, or a race in the SDK's own
+# wait_move() (which polls motion *state*, not final position, so a command
+# issued with ~0 gap after the previous move can observe a stale "not moving"
+# reading and return early). Verify actual vs. commanded joints after every
+# wait=True move and treat a mismatch as a failure instead of trusting the SDK.
+_POSITION_VERIFY_TOL_RAD = 0.05   # rad (~2.9°) — per-joint tolerance for "did we get there"
+_MOVE_SETTLE_S           = 0.1    # seconds after a confirmed move, before the next command
 
 
 # ── Abstract base ─────────────────────────────────────────────────────────────
@@ -77,7 +101,13 @@ class ArmController(ABC):
             ``max_joint_delta`` from the current position.  Set False only for
             recovery homing moves where the arm may be in an unexpected position.
 
-        Returns True on success, False if the move was rejected.
+        Returns True on success, False if the move was rejected OR (when
+        ``wait=True``) if the arm's actual final position doesn't match
+        ``theta`` — callers rely on False meaning "did not get there," not just
+        "the command was rejected," so implementations must verify the actual
+        result rather than trusting a lower-level SDK's return code alone (see
+        ``XArmController.move_to_angles`` for why: some SDKs report success
+        even when a collision/fault stopped the arm short of the target).
         """
 
     @abstractmethod
@@ -135,8 +165,39 @@ class XArmController(ArmController):
 
         log.info("Connected to xArm at %s", robot_ip)
 
+        # Sync the real, controller-configured TCP offset (flange -> gripper
+        # tip, set once via scripts/calibrate_T_cam_base.py's --tcp-offset and
+        # persisted on the controller) into our own Lite6IKSolver model, which
+        # otherwise computes FK/IK for the bare flange. Without this, every
+        # Cartesian target (hover, pick, place) is silently reached ~1 tool
+        # length short along the approach axis — confirmed as the cause of a
+        # real hardware collision (the arm ends up well past the intended
+        # grasp point). Reading it from the arm itself (ground truth for
+        # whatever gripper is physically attached) instead of hardcoding it in
+        # config keeps the two in sync even if the arm is recalibrated.
+        if ik_solver is not None and hasattr(ik_solver, "set_tcp_offset"):
+            try:
+                time.sleep(0.3)  # let the real-time report stream populate tcp_offset
+                offset = self._arm.tcp_offset  # [x,y,z (mm), roll,pitch,yaw (rad)]
+                xyz_m  = [v * _XARM_MM_TO_M for v in offset[:3]]
+                rpy_rad = list(offset[3:6])
+                ik_solver.set_tcp_offset(xyz_m, rpy_rad)
+                log.info(
+                    "Synced TCP offset from arm into IK solver: xyz=%s m  rpy=%s rad",
+                    [round(v, 4) for v in xyz_m], [round(v, 4) for v in rpy_rad],
+                )
+            except Exception as e:
+                log.warning(
+                    "Could not read TCP offset from arm (%s) — IK solver will use "
+                    "whatever tcp_offset it was constructed with (default: none). "
+                    "Cartesian targets may be off by the flange-to-tip distance.", e,
+                )
+
         # One-time FK sanity check: compare the robot controller's built-in FK
-        # with our Python model so any URDF / firmware mismatch is caught early.
+        # with our Python model so any URDF / firmware / TCP-offset mismatch is
+        # caught early. Should now be small (a few mm) — a large, systematic
+        # delta here (especially one that grows/shrinks with a fixed direction
+        # relative to the EE) means the TCP offset sync above didn't take.
         if ik_solver is not None:
             try:
                 code2, theta_now = self._arm.get_servo_angle(is_radian=True)
@@ -184,6 +245,19 @@ class XArmController(ArmController):
                     fk_pos[0], fk_pos[1], fk_pos[2],
                     np.round(np.array(theta[:6]), 3).tolist(),
                 )
+
+    def _log_fault_reason(self) -> None:
+        """Log the controller's actual error/warning code after a move failure.
+
+        ``show=True`` also makes the xArm SDK itself log a human-readable
+        description (error/warning title) via its own logger.
+        """
+        try:
+            code, (err_code, warn_code) = self._arm.get_err_warn_code(show=True)
+            if code == 0:
+                log.error("Controller fault reason: error_code=%s warn_code=%s", err_code, warn_code)
+        except Exception as e:
+            log.debug("get_err_warn_code failed: %s", e)
 
     def move_to_angles(self, theta: np.ndarray, wait: bool = True, safe: bool = True) -> bool:
         """Move to explicit joint angles (radians).
@@ -233,25 +307,58 @@ class XArmController(ArmController):
 
         if code not in (0, None):
             log.error("set_servo_angle failed (code=%d)", code)
+            self._log_fault_reason()
             if self._arm.state in (4, 5):
                 log.warning("Arm in stop/error state — auto-recovering")
                 self._recover()
             return False
 
-        # Log actual post-move joint angles and FK EE position for diagnostics
+        # Verify the arm actually reached the commanded target — set_servo_angle's
+        # return code only reflects whether the SDK's wait_move() saw the motion
+        # *state* clear, not whether the final position matches what we asked
+        # for. A collision/torque stop mid-move, or a race in wait_move() when
+        # commands are issued back-to-back, can both report success here while
+        # the arm silently stalls partway. Catch that before the caller trusts
+        # this move (e.g. before closing the gripper on a partial/wrong pose).
         if wait:
             code2, actual = self._arm.get_servo_angle(is_radian=True)
-            if code2 == 0:
-                actual_arr = np.array(actual[:6])
-                if self._ik is not None:
-                    fk_pos, _ = self._ik.fk(actual_arr)
-                    log.info(
-                        "✓ ACT angles %s  EE=[%.3f, %.3f, %.3f]m",
-                        np.round(actual_arr, 3).tolist(),
-                        fk_pos[0], fk_pos[1], fk_pos[2],
-                    )
-                else:
-                    log.info("✓ ACT angles %s", np.round(actual_arr, 3).tolist())
+            if code2 != 0:
+                log.error(
+                    "Post-move verification failed — could not read back servo "
+                    "angles (code=%d); treating move as failed.", code2,
+                )
+                return False
+
+            actual_arr = np.array(actual[:6])
+            verify_delta = np.abs(actual_arr - theta)
+            if np.any(verify_delta > _POSITION_VERIFY_TOL_RAD):
+                log.error(
+                    "MOVE DID NOT REACH TARGET: commanded %s but arm is at %s "
+                    "(delta=%s rad, tol=%.3f) — set_servo_angle reported success "
+                    "but the joints never got there (likely a collision/torque "
+                    "stop, or a wait_move() race from back-to-back commands).",
+                    np.round(theta, 3).tolist(), np.round(actual_arr, 3).tolist(),
+                    np.round(verify_delta, 3).tolist(), _POSITION_VERIFY_TOL_RAD,
+                )
+                self._log_fault_reason()
+                if self._arm.state in (4, 5):
+                    log.warning("Arm in stop/error state — auto-recovering")
+                    self._recover()
+                return False
+
+            if self._ik is not None:
+                fk_pos, _ = self._ik.fk(actual_arr)
+                log.info(
+                    "✓ ACT angles %s  EE=[%.3f, %.3f, %.3f]m",
+                    np.round(actual_arr, 3).tolist(),
+                    fk_pos[0], fk_pos[1], fk_pos[2],
+                )
+            else:
+                log.info("✓ ACT angles %s", np.round(actual_arr, 3).tolist())
+
+            # Settle gap before any immediately-following move command, to avoid
+            # racing wait_move()'s motion-state polling on the next call.
+            time.sleep(_MOVE_SETTLE_S)
 
         return True
 
